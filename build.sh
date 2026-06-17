@@ -87,7 +87,10 @@ select_max_jobs() {
 }
 
 validate_cuda_dev_files() {
+  # Standard CUDA installer puts static libs under targets/x86_64-linux/lib;
+  # Nix cuda-merged uses a flattened layout with libs directly under lib/.
   local lib_dir="$CUDA_HOME/targets/x86_64-linux/lib"
+  [[ -d "$lib_dir" ]] || lib_dir="$CUDA_HOME/lib"
   local missing=()
   local file
 
