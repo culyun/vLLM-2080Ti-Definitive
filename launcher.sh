@@ -2847,6 +2847,7 @@ payload = {
     "messages": [{"role": "user", "content": "Reply with OK."}],
     "max_tokens": 8,
     "temperature": 0,
+    "chat_template_kwargs": {"enable_thinking": False},
 }
 req = urllib.request.Request(
     f"http://{host}:{port}/v1/chat/completions",
