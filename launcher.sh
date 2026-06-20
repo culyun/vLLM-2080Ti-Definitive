@@ -2430,7 +2430,25 @@ guess_model_family() {
 }
 
 guess_quantization() {
+  local raw_dir=$1
   local dir=${1,,}
+  local config_json="$raw_dir/config.json"
+  if [[ -f "$config_json" ]]; then
+    local quant_method
+    quant_method=$(grep -o '"quant_method"[[:space:]]*:[[:space:]]*"[^"]*"' "$config_json" 2>/dev/null \
+      | head -1 | sed -E 's/.*"([^"]+)"[[:space:]]*$/\1/')
+    case "$quant_method" in
+      compressed-tensors) echo "compressed-tensors"; return ;;
+      awq) echo awq_marlin; return ;;
+      gptq) echo gptq_marlin; return ;;
+      fp8) echo fp8; return ;;
+      quark) echo quark; return ;;
+    esac
+  fi
+  # Fallback: config.json absent, unreadable, or quant_method not recognized
+  # above — guess from the directory name. Filename-based quant tags (e.g.
+  # "-AWQ" suffixes) are not always accurate; config.json's quant_method is
+  # ground truth and is checked first.
   if [[ "$dir" == *fp8* ]]; then
     echo fp8
   elif [[ "$dir" == *gptq* ]]; then
