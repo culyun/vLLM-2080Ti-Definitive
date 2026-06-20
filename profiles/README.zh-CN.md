@@ -9,6 +9,14 @@
 这里列出的上下文容量和吞吐数据，验证硬件是双 RTX 2080 Ti 22GB，tensor
 parallel size 2。
 
+`launcher.sh` 也支持通过 pipeline parallel 接入第 3 张 GPU（`TP_SIZE=1`、
+`PP_SIZE=3`，在菜单第 3 项中按 `t` 键切换，详见 `--help`）。这一路径**为实验
+性、未经验证**，本指南中的数据并不适用：当某个模型的 attention/Mamba head
+数量无法被 3 整除（导致 `TENSOR_PARALLEL_SIZE=3` 无法加载）、又想用上 3 张卡
+合并后的显存池时可以使用，但 pipeline parallel 的各阶段不会像 tensor
+parallel 那样让单条请求的解码吞吐成倍提升，并且跨双 Xeon NUMA 边界的流水线
+阶段会引入额外延迟，这是 NVLink 互连的两张卡做 TP=2 所没有的问题。
+
 目录结构：
 
 ```text

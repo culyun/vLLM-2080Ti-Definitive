@@ -10,6 +10,16 @@ checkpoint path. Choose the model directory separately in `launcher.sh` or with
 The shipped context and throughput numbers were validated on 2x RTX 2080 Ti
 22GB cards with tensor parallel size 2.
 
+`launcher.sh` also supports a 3rd GPU via pipeline parallelism (`TP_SIZE=1`,
+`PP_SIZE=3`, picked with the `t` key in menu item 3 — see `--help`). This is
+**experimental, not validated** against the numbers in this guide: it is
+useful when a model's attention/Mamba head counts don't divide evenly by 3
+(so `TENSOR_PARALLEL_SIZE=3` fails to load) and you want the combined VRAM
+pool across 3 GPUs, but pipeline-parallel stages don't multiply
+single-stream decode throughput the way tensor parallel does, and crossing
+the dual-Xeon NUMA boundary at a pipeline stage adds latency that TP=2 on
+the NVLinked pair does not have.
+
 Profile layout:
 
 ```text

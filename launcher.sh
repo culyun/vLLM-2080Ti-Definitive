@@ -248,7 +248,7 @@ read_profile_value() {
 
 profile_key_is_global() {
   case "$1" in
-MODEL_DIR|PROFILE_DIR|PROFILE|MODE|PORT|SERVICE_SCOPE|GPU_DEVICES|TP_SIZE|\
+MODEL_DIR|PROFILE_DIR|PROFILE|MODE|PORT|SERVICE_SCOPE|GPU_DEVICES|TP_SIZE|PP_SIZE|\
 CHAT_TEMPLATE_FILE|CHAT_TEMPLATE_PRESET|TEMPLATE_DIR|REASONING_PARSER|\
 DEFAULT_CHAT_TEMPLATE_KWARGS|REASONING_MODE|REASONING_BUDGET|\
 ENABLE_AUTO_TOOL_CHOICE|TOOL_CALL_PARSER|TOOL_PARSER_PLUGIN|\
@@ -346,6 +346,7 @@ save_manager_state() {
     printf 'SPECULATIVE_CONFIG=%q\n' "${SPECULATIVE_CONFIG:-}"
     printf 'COMPILATION_CONFIG_JSON=%q\n' "${COMPILATION_CONFIG_JSON:-}"
     printf 'TP_SIZE=%q\n' "${TP_SIZE:-}"
+    printf 'PP_SIZE=%q\n' "${PP_SIZE:-}"
     printf 'CHAT_TEMPLATE_FILE=%q\n' "${CHAT_TEMPLATE_FILE:-}"
     printf 'CHAT_TEMPLATE_PRESET=%q\n' "${CHAT_TEMPLATE_PRESET:-}"
     printf 'ATTENTION_BACKEND=%q\n' "${ATTENTION_BACKEND:-}"
@@ -593,6 +594,36 @@ gpu_device_count() {
     [[ -n "$part" ]] && count=$((count + 1))
   done
   echo "$count"
+}
+
+# Divisors of a GPU count, ascending. Used to offer valid TP_SIZE choices
+# when the remaining GPUs (count / TP_SIZE) run pipeline-parallel instead —
+# vLLM requires tensor_parallel_size * pipeline_parallel_size == world size,
+# and the model's attention/Mamba head counts must divide TP_SIZE evenly
+# (see vllm/model_executor/layers/mamba/mamba_mixer2.py), so not every GPU
+# count yields a usable TP_SIZE > 1.
+divisors_of() {
+  local n=$1 i
+  (( n > 0 )) || return 0
+  for ((i = 1; i <= n; i++)); do
+    (( n % i == 0 )) && echo "$i"
+  done
+}
+
+next_tp_divisor() {
+  local current=$1 count=$2
+  local divs=() d found=0 next=""
+  mapfile -t divs < <(divisors_of "$count")
+  ((${#divs[@]})) || { echo "${current:-1}"; return 0; }
+  for d in "${divs[@]}"; do
+    if (( found == 1 )); then
+      next=$d
+      break
+    fi
+    [[ "$d" == "$current" ]] && found=1
+  done
+  [[ -z "$next" ]] && next=${divs[0]}
+  echo "$next"
 }
 
 list_nvidia_gpus() {
@@ -1066,7 +1097,16 @@ Main menu:
   1. Weight directory: choose the checkpoint directory.
   2. Profile: choose a profile directory, apply .env route presets, select a
      chat-template preset, and edit the filled runtime parameters.
-  3. GPU / TP selection: select GPUs with Space; TP size follows GPU count.
+  3. GPU / TP / PP selection: select GPUs with Space; TP size defaults to the
+     GPU count. Press 't' to cycle TP_SIZE through divisors of the selected
+     GPU count — the remainder (GPU count / TP_SIZE) becomes PP_SIZE
+     (pipeline-parallel). Use PP when the model's attention/Mamba head
+     counts don't divide evenly by the GPU count (e.g. 3 GPUs with a model
+     whose head counts are powers of 2: TP=3 fails to load, so pick TP=1 to
+     get PP=3 instead). PP has lower per-layer communication than TP, which
+     suits GPUs that aren't all on the same NVLink/PCIe-NUMA segment, but it
+     does not multiply single-stream decode throughput the way TP does —
+     it mainly buys you the combined VRAM pool to fit a bigger model.
   4. Launch mode: safe, normal, fast, or aggressive.
   5. Port: default 8000.
   6. Service scope: local only or local + LAN.
@@ -1183,25 +1223,48 @@ gpu_selected() {
 
 select_gpu_devices_menu() {
   local rows=() selected_devices idx=0 key count current_line gpu_idx gpu_name new_devices tp_count
+  local tp_size_sel pp_size_sel
   mapfile -t rows < <(list_nvidia_gpus || true)
   selected_devices=${GPU_DEVICES:-$(detect_default_gpu_devices)}
 
   if ((${#rows[@]} == 0)) || ! is_tty; then
     GPU_DEVICES=$(prompt_default "GPU devices / CUDA_VISIBLE_DEVICES" "$selected_devices") || return 0
     tp_count=$(gpu_device_count "$GPU_DEVICES")
-    (( tp_count > 0 )) && TP_SIZE="$tp_count"
+    if (( tp_count > 0 )); then
+      TP_SIZE=$(prompt_default \
+        "Tensor-parallel size (must evenly divide GPU count $tp_count; remaining GPUs run pipeline-parallel)" \
+        "${TP_SIZE:-$tp_count}") || return 0
+      if ! [[ "$TP_SIZE" =~ ^[0-9]+$ ]] || (( TP_SIZE < 1 )) || (( tp_count % TP_SIZE != 0 )); then
+        echo "TP_SIZE must be a positive divisor of $tp_count. Falling back to TP_SIZE=$tp_count, PP_SIZE=1." >&2
+        TP_SIZE=$tp_count
+      fi
+      PP_SIZE=$(( tp_count / TP_SIZE ))
+    fi
     save_manager_state
     return 0
   fi
 
   count=${#rows[@]}
+  tp_count=$(gpu_device_count "$selected_devices")
+  tp_size_sel=${TP_SIZE:-$tp_count}
+  (( tp_count > 0 )) || tp_size_sel=1
+  (( tp_count > 0 && tp_size_sel > 0 && tp_count % tp_size_sel == 0 )) || tp_size_sel=$tp_count
+
   while true; do
+    tp_count=$(gpu_device_count "$selected_devices")
+    if (( tp_count == 0 )) || (( tp_size_sel < 1 )) || (( tp_count % tp_size_sel != 0 )); then
+      tp_size_sel=$tp_count
+    fi
+    pp_size_sel=1
+    (( tp_count > 0 )) && pp_size_sel=$(( tp_count / tp_size_sel ))
+
     clear >/dev/tty
     {
       banner
-      echo "GPU / TP selection"
+      echo "GPU / TP / PP selection"
       echo
-      echo "Space toggles a GPU. Enter confirms. TP size follows selected GPU count."
+      echo "Space toggles a GPU. 't' cycles tensor-parallel size; the remaining"
+      echo "GPUs (count / TP) run pipeline-parallel. Enter confirms."
       echo
       for i in "${!rows[@]}"; do
         current_line=${rows[$i]}
@@ -1219,7 +1282,11 @@ select_gpu_devices_menu() {
         fi
       done
       echo
-      printf 'Selected: %s    TP_SIZE: %s\n' "${selected_devices:-none}" "$(gpu_device_count "$selected_devices")"
+      if (( pp_size_sel > 1 )); then
+        printf 'Selected: %s    TP_SIZE: %s    PP_SIZE: %s\n' "${selected_devices:-none}" "$tp_size_sel" "$pp_size_sel"
+      else
+        printf 'Selected: %s    TP_SIZE: %s\n' "${selected_devices:-none}" "$tp_size_sel"
+      fi
     } >/dev/tty
 
     IFS= read -rsn1 key </dev/tty || true
@@ -1252,6 +1319,11 @@ select_gpu_devices_menu() {
           selected_devices="$gpu_idx"
         fi
       fi
+      # Selection changed: reset to full-TP (old default behavior) until
+      # the user explicitly cycles TP/PP again with 't'.
+      tp_size_sel=$(gpu_device_count "$selected_devices")
+    elif [[ "$key" == "t" || "$key" == "T" ]]; then
+      (( tp_count > 0 )) && tp_size_sel=$(next_tp_divisor "$tp_size_sel" "$tp_count")
     elif [[ "$key" == "" ]]; then
       if [[ -z "$selected_devices" ]]; then
         echo "Select at least one GPU." >/dev/tty
@@ -1259,7 +1331,8 @@ select_gpu_devices_menu() {
         continue
       fi
       GPU_DEVICES="$selected_devices"
-      TP_SIZE=$(gpu_device_count "$GPU_DEVICES")
+      TP_SIZE="$tp_size_sel"
+      PP_SIZE=$(( tp_count / tp_size_sel ))
       save_manager_state
       return 0
     elif [[ "$key" == "q" || "$key" == "Q" ]]; then
@@ -1969,6 +2042,7 @@ show_launch_status() {
   echo "  Served model: ${SERVED_NAME:-unknown}"
   echo "  Model path:   ${MODEL_DIR:-unknown}"
   echo "  GPU devices:  ${GPU_DEVICES:-${CUDA_VISIBLE_DEVICES:-unknown}}"
+  echo "  TP / PP size: ${TP_SIZE:-unknown} / ${PP_SIZE:-1}"
   echo "  Mode:         ${MODE:-safe}"
   echo "  Scope:        ${SERVICE_SCOPE:-local}"
   echo "  Local API:    ${LAST_API_LOCAL:-http://127.0.0.1:${PORT:-8000}/v1}"
@@ -2577,6 +2651,7 @@ build_args() {
     --max-num-batched-tokens "$MAX_BATCHED_TOKENS"
   )
 
+  [[ "${PP_SIZE:-1}" -gt 1 ]] && VLLM_ARGS+=(--pipeline-parallel-size "$PP_SIZE")
   [[ -n "${QUANTIZATION:-}" ]] && VLLM_ARGS+=(--quantization "$QUANTIZATION")
   [[ -n "${KV_CACHE_DTYPE:-}" ]] && VLLM_ARGS+=(--kv-cache-dtype "$KV_CACHE_DTYPE")
   [[ -n "${MAMBA_CACHE_MODE:-}" ]] && VLLM_ARGS+=(--mamba-cache-mode "$MAMBA_CACHE_MODE")
@@ -2872,6 +2947,7 @@ launch_server() {
   fi
   GPU_DEVICES=${GPU_DEVICES:-$(detect_default_gpu_devices)}
   TP_SIZE=${TP_SIZE:-$(gpu_device_count "$GPU_DEVICES")}
+  PP_SIZE=${PP_SIZE:-1}
   if [[ -z "${SERVED_NAME:-}" || "$SERVED_NAME" == "." || "$SERVED_NAME" == "/" ]]; then
     echo "ERROR: Served model name is empty. Set SERVED_NAME or choose a valid checkpoint directory." >&2
     return 1
@@ -2922,6 +2998,7 @@ launch_server() {
     echo "Mode: $MODE"
     echo "GPU devices: ${GPU_DEVICES:-}"
     echo "TP size: ${TP_SIZE:-}"
+    echo "PP size: ${PP_SIZE:-1}"
     echo "Port: $PORT"
     echo "Scope: $SERVICE_SCOPE"
     echo "MTP graph policy: VLLM_SM75_SPEC_SYNC_MODE=${VLLM_SM75_SPEC_SYNC_MODE:-auto}, VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH=${VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH:-0}"
@@ -3131,6 +3208,12 @@ prepare_runtime_defaults() {
   TEMPLATE_DIR=${TEMPLATE_DIR:-"$PROFILE_DIR/templates"}
   GPU_DEVICES=${GPU_DEVICES:-$(detect_default_gpu_devices)}
   TP_SIZE=${TP_SIZE:-$(gpu_device_count "$GPU_DEVICES")}
+  PP_SIZE=${PP_SIZE:-1}
+  local gpu_count_check=$(gpu_device_count "$GPU_DEVICES")
+  if (( TP_SIZE * PP_SIZE != gpu_count_check )); then
+    echo "ERROR: TP_SIZE ($TP_SIZE) * PP_SIZE ($PP_SIZE) must equal the selected GPU count ($gpu_count_check)." >&2
+    return 1
+  fi
   QUANTIZATION=${QUANTIZATION:-$(guess_quantization "$MODEL_DIR")}
   MAX_MODEL_LEN=${MAX_MODEL_LEN:-$(default_context_tokens)}
   GPU_UTIL=${GPU_UTIL:-$(default_gpu_util)}
@@ -3189,6 +3272,7 @@ Launch summary:
   vLLM --quantization:  ${QUANTIZATION:-auto}
   W/A type:             $(guess_precision_scheme "$MODEL_DIR" "${QUANTIZATION:-}")
   GPU devices:          ${GPU_DEVICES:-$(detect_default_gpu_devices)}
+  TP size / PP size:    ${TP_SIZE:-} / ${PP_SIZE:-1}
   KV precision:         ${KV_CACHE_DTYPE:-fp16}
   Mamba cache mode:     ${MAMBA_CACHE_MODE:-auto}
   Context tokens:       $MAX_MODEL_LEN
@@ -3268,9 +3352,10 @@ render_main_menu_item() {
 
 render_main_menu() {
   local current=${1:-1}
-  local gpu_devices tp_size
+  local gpu_devices tp_size pp_size
   gpu_devices=${GPU_DEVICES:-$(detect_default_gpu_devices)}
   tp_size=${TP_SIZE:-$(gpu_device_count "$gpu_devices")}
+  pp_size=${PP_SIZE:-1}
 
   if is_tty; then
     clear >/dev/tty 2>/dev/null || true
@@ -3295,7 +3380,11 @@ render_main_menu() {
   printf '     Chat template:    %s\n' "$(menu_value "$(current_template_label)")"
   printf '     Reasoning:        %s\n' "$(menu_value "$(current_reasoning_label)")"
   printf '     Tool calling:     %s\n' "$(menu_value "$(current_tool_calling_label)")"
-  render_main_menu_item 3 "$current" "3. GPU/TP setting:  $(menu_value "$gpu_devices") / TP $(menu_value "$tp_size")"
+  if (( pp_size > 1 )); then
+    render_main_menu_item 3 "$current" "3. GPU/TP/PP setting: $(menu_value "$gpu_devices") / TP $(menu_value "$tp_size") / PP $(menu_value "$pp_size")"
+  else
+    render_main_menu_item 3 "$current" "3. GPU/TP setting:  $(menu_value "$gpu_devices") / TP $(menu_value "$tp_size")"
+  fi
   render_main_menu_item 4 "$current" "4. Launch mode:      ${MODE:-normal}"
   render_main_menu_item 5 "$current" "5. Port:             ${PORT:-8000}"
   render_main_menu_item 6 "$current" "6. Service scope:    $(current_scope_label)"
