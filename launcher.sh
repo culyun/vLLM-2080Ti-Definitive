@@ -1107,6 +1107,10 @@ Main menu:
      suits GPUs that aren't all on the same NVLink/PCIe-NUMA segment, but it
      does not multiply single-stream decode throughput the way TP does —
      it mainly buys you the combined VRAM pool to fit a bigger model.
+     MTP speculative decoding (MTP_K > 0 / SPECULATIVE_CONFIG) is rejected
+     when PP_SIZE > 1: this fork's MTP draft model does not implement
+     vLLM's SupportsPP interface, so engine startup fails. Use MTP_K=0
+     (a non-MTP profile) under PP.
   4. Launch mode: safe, normal, fast, or aggressive.
   5. Port: default 8000.
   6. Service scope: local only or local + LAN.
@@ -3220,6 +3224,15 @@ prepare_runtime_defaults() {
   MAX_BATCHED_TOKENS=${MAX_BATCHED_TOKENS:-2048}
   MAX_NUM_SEQS=${MAX_NUM_SEQS:-1}
   MTP_K=${MTP_K:-0}
+  if (( PP_SIZE > 1 )) && { (( MTP_K > 0 )) || [[ -n "${SPECULATIVE_CONFIG:-}" ]]; }; then
+    echo "ERROR: MTP/speculative decoding (MTP_K=$MTP_K) is not supported together with" >&2
+    echo "  pipeline parallelism (PP_SIZE=$PP_SIZE) in this fork: the MTP draft model" >&2
+    echo "  (Qwen3NextMTP) does not implement the vLLM SupportsPP interface, so engine" >&2
+    echo "  startup fails in create_speculative_config -> verify_with_parallel_config." >&2
+    echo "  Set MTP_K=0 and clear SPECULATIVE_CONFIG (or pick a non-MTP profile) when" >&2
+    echo "  using PP_SIZE > 1." >&2
+    return 1
+  fi
   PORT=${PORT:-8000}
   MODE=${MODE:-normal}
   normalize_mode
