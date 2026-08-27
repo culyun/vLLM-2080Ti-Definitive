@@ -1231,7 +1231,7 @@ compute_total_steps() {
   fi
 
   total=$((total + 7))  # build frontend + torch stack + requirement install/revalidation
-  total=$((total + 8))  # FlashQLA/CUTLASS/Triton fetch+install + runtime build/validation
+  total=$((total + 9))  # FlashQLA/CUTLASS/Triton fetch+install + runtime build + FlashInfer sampling prebuild + validation
 
   printf '%s\n' "$total"
 }
@@ -1524,6 +1524,34 @@ print(f"torch_extensions_dir={os.environ.get('TORCH_EXTENSIONS_DIR', '')}")
 PY
 }
 
+prebuild_flashinfer_sampling_ops() {
+  # FLASHINFER_ENABLE_AOT=1 alone pre-builds nothing here: the
+  # flashinfer-python wheel ships source-only kernels that are JIT-compiled
+  # on first use into ~/.cache/flashinfer/<version>/<sm>/cached_ops, which
+  # requires a working nvcc at *serving* time. The sampling module is
+  # selected unconditionally at engine startup (FlashInfer top-p/top-k
+  # sampler), so warm it at build time; a cold sampling cache otherwise
+  # kills the engine during its first memory-profiling run. Attention
+  # modules stay JIT — their build keys depend on per-profile
+  # dtype/head-dim configs and cannot be enumerated here.
+  env \
+    CUDA_HOME="$CUDA_HOME" \
+    CUDA_PATH="$CUDA_PATH" \
+    CUDACXX="$CUDACXX" \
+    TORCH_CUDA_ARCH_LIST="$TORCH_CUDA_ARCH_LIST" \
+    .venv/bin/python - <<'PY'
+from flashinfer.jit import build_jit_specs
+from flashinfer.jit.sampling import gen_sampling_module
+
+spec = gen_sampling_module()
+build_jit_specs([spec], verbose=True)
+lib_path = spec.get_library_path()
+if not lib_path.is_file():
+    raise SystemExit(f"FlashInfer sampling ops did not produce a library: {lib_path}")
+print(f"flashinfer_sampling_ops={lib_path}")
+PY
+}
+
 validate_runtime_components() {
   env \
     CUDA_HOME="$CUDA_HOME" \
@@ -1558,6 +1586,8 @@ run_with_progress "Build and install vLLM 2080 Ti Definitive runtime" \
     TRITON_KERNELS_SRC_DIR="$TRITON_KERNELS_SRC_DIR" \
     VLLM_VERSION_OVERRIDE="$VERSION" \
     uv pip install --python .venv/bin/python --no-build-isolation --no-deps -e .
+
+run_with_progress "Prebuild FlashInfer sampling ops" prebuild_flashinfer_sampling_ops
 
 run_with_progress "Validate runtime components" validate_runtime_components
 
