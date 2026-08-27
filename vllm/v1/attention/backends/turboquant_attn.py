@@ -16,6 +16,7 @@ Per-head per-position slot layout:
   For turboquant_k3v4_nc head_dim=256: [100 bytes key | 512 bytes value] = 612
 """
 
+from collections import OrderedDict
 import functools
 import math
 import os
@@ -58,9 +59,11 @@ from vllm.v1.worker.workspace import (
 )
 from vllm.v1.attention.ops.triton_turboquant_decode import (
     _tq_full_dequant_kv,
-    _use_fp8_e4b15,
+    _fp8_format_code,
+    _fp8_format_name,
     triton_turboquant_decode_attention,
 )
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 from vllm.v1.attention.ops.triton_turboquant_store import triton_turboquant_store
 
 _HAS_FLASH_ATTN = is_flash_attn_varlen_func_available()
@@ -96,6 +99,39 @@ _CONTINUATION_DECODE_THRESHOLD = 128
 _SPEC_CONTINUATION_DECODE_FASTPATH = (
     os.getenv("VLLM_TURBOQUANT_SPEC_CONTINUATION_DECODE_FASTPATH", "0") == "1"
 )
+
+
+def _normalize_tq_prefix_combine_mode(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized in ("1", "true", "yes", "on", "force", "always"):
+        return "on"
+    if normalized in ("0", "false", "no", "off", "disable", "disabled"):
+        return "off"
+    if normalized in ("", "auto"):
+        return "auto"
+    raise ValueError(
+        "VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE must be one of "
+        "off, on, auto, 0, or 1"
+    )
+
+
+_TQ_CONTINUATION_PREFIX_COMBINE_MODE = _normalize_tq_prefix_combine_mode(
+    os.getenv("VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE", "auto")
+)
+_TQ_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS = max(
+    0,
+    int(os.getenv("VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS", "20480")),
+)
+
+
+def _tq_continuation_prefix_combine_enabled(seq_len: int) -> bool:
+    if _TQ_CONTINUATION_PREFIX_COMBINE_MODE == "on":
+        return True
+    if _TQ_CONTINUATION_PREFIX_COMBINE_MODE == "auto":
+        return seq_len >= _TQ_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS
+    return False
+
+
 def _normalize_turboquant_flashinfer_backend(value: str) -> str:
     normalized = value.strip().lower()
     if normalized in ("1", "true", "yes", "on"):
@@ -112,6 +148,12 @@ _GEMMA4_TQ_DECODE_D512_SDPA_FALLBACK = (
 )
 _GEMMA4_TQ_DECODE_D256_SDPA_FALLBACK = (
     os.getenv("VLLM_GEMMA4_TQ_DECODE_D256_SDPA_FALLBACK", "0") == "1"
+)
+_TQ_FORCE_DECODE_SDPA = (
+    os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA", "0") == "1"
+)
+_TQ_FORCE_CONTINUATION_SDPA = (
+    os.getenv("VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA", "0") == "1"
 )
 _GEMMA4_TQ4NC_SHARED_DRAFT_SDPA_FALLBACK = (
     os.getenv("VLLM_GEMMA4_TQ4NC_SHARED_DRAFT_SDPA_FALLBACK", "0") == "1"
@@ -154,6 +196,15 @@ _SM75_TQ_FI_CONTINUATION_MIN_QUERY_LEN = int(
 _DEFAULT_TQ_FI_PLAN_CACHE = (
     os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE", "1") == "1"
 )
+_TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE = max(
+    1,
+    int(
+        os.getenv(
+            "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE",
+            "16",
+        )
+    ),
+)
 _TQ_FI_PREFILL_CUDAGRAPH_SAFE = (
     os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE", "0") == "1"
 )
@@ -166,12 +217,34 @@ _TQ_CONTINUATION_SDPA_Q_CHUNK = int(
 _TQ_CONTINUATION_SDPA_MAX_QK_CELLS = int(
     os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS", "0")
 )
+_TQ_FORCE_DECODE_SDPA_MAX_QK_CELLS = int(
+    os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS", "131072")
+)
 _TQ_CUDAGRAPH_SPEC_DECODE_SAFE = (
     os.getenv("VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE", "0") == "1"
 )
+_TQ_DEBUG_MIXED = os.getenv("VLLM_TURBOQUANT_DEBUG_MIXED", "0") == "1"
 _SKIP_PREFILL_STORE_FOR_PROFILING = (
     os.getenv("VLLM_TURBOQUANT_SKIP_PREFILL_STORE", "0") == "1"
 )
+
+
+def _read_tq_max_kv_splits_override() -> int | None:
+    value = os.getenv("VLLM_TURBOQUANT_MAX_KV_SPLITS")
+    if value is None or value == "":
+        return None
+    try:
+        splits = int(value)
+    except ValueError as err:
+        raise ValueError(
+            "VLLM_TURBOQUANT_MAX_KV_SPLITS must be a positive integer"
+        ) from err
+    if splits <= 0:
+        raise ValueError("VLLM_TURBOQUANT_MAX_KV_SPLITS must be a positive integer")
+    return splits
+
+
+_TQ_MAX_KV_SPLITS_OVERRIDE = _read_tq_max_kv_splits_override()
 _GEMMA4_TQ4NC_DEBUG_CONTINUATION = (
     os.getenv("VLLM_GEMMA4_TQ4NC_DEBUG_CONTINUATION", "0") == "1"
 )
@@ -194,7 +267,7 @@ _GEMMA4_TQ4NC_SHARED_FP16_TRITON = (
     and os.getenv("VLLM_GEMMA4_TQ4NC_SHARED_FP16_TRITON", "0") == "1"
 )
 _TQ_FI_PREFILL_WORKSPACES: dict[tuple[str, str], torch.Tensor] = {}
-_TQ_FI_PREFILL_WRAPPERS: dict[tuple[Any, ...], Any] = {}
+_TQ_FI_PREFILL_WRAPPERS: OrderedDict[tuple[Any, ...], Any] = OrderedDict()
 logger = init_logger(__name__)
 
 
@@ -520,7 +593,6 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         )
 
         self.tq_config = TurboQuantConfig.from_cache_dtype(kv_cache_dtype, head_size)
-
         # Pre-compute kernel constants from config (avoid repeated arithmetic)
         cfg = self.tq_config
         self._mse_bytes = (
@@ -530,6 +602,18 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         )
         self._val_data_bytes = math.ceil(head_size * cfg.effective_value_quant_bits / 8)
         self._n_centroids = cfg.n_centroids if not cfg.key_fp8 else 1
+        if cfg.key_fp8:
+            device_index = torch.cuda.current_device() if torch.cuda.is_available() else 0
+            fp8_override = os.getenv(
+                "VLLM_TURBOQUANT_K8V4_FP8_FORMAT",
+                "auto",
+            ).strip().lower() or "auto"
+            logger.info_once(
+                "TurboQuant raw FP8 key format is %s "
+                "(VLLM_TURBOQUANT_K8V4_FP8_FORMAT=%s)",
+                _fp8_format_name(device_index),
+                fp8_override,
+            )
 
         self._fi_prefill_workspace = None
         self._fi_prefill_backend = _DEFAULT_TQ_FI_BACKEND
@@ -585,8 +669,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         # and benchmarks show no regression vs dynamic in eager mode).
         vllm_config = get_current_vllm_config()
         self.max_num_kv_splits = (
-            vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
+            _TQ_MAX_KV_SPLITS_OVERRIDE
+            or vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
         )
+        if _TQ_MAX_KV_SPLITS_OVERRIDE is not None:
+            logger.info_once(
+                "TurboQuant decode max KV splits forced to %s by "
+                "VLLM_TURBOQUANT_MAX_KV_SPLITS",
+                self.max_num_kv_splits,
+            )
+        if _TQ_FORCE_DECODE_SDPA:
+            logger.info_once(
+                "TurboQuant decode is forced to full-dequant SDPA fallback by "
+                "VLLM_TURBOQUANT_FORCE_DECODE_SDPA=1"
+            )
+        if _TQ_FORCE_CONTINUATION_SDPA:
+            logger.info_once(
+                "TurboQuant continuation prefill is forced to full-dequant "
+                "SDPA fallback by VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA=1"
+            )
+        if _TQ_CONTINUATION_PREFIX_COMBINE_MODE != "off":
+            logger.info_once(
+                "TurboQuant continuation prefix-combine experiment is enabled "
+                "with mode=%s min_tokens=%s",
+                _TQ_CONTINUATION_PREFIX_COMBINE_MODE,
+                _TQ_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS,
+            )
 
     def _get_flashinfer_prefill_wrapper(self, device: torch.device):
         if not self._use_flashinfer_prefill:
@@ -629,6 +737,24 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         cache_key = (str(norm_device), self._fi_prefill_backend, *plan_key)
         wrapper = _TQ_FI_PREFILL_WRAPPERS.get(cache_key)
         if wrapper is None:
+            if _TQ_FI_PREFILL_CUDAGRAPH_SAFE:
+                # A graph-safe wrapper owns the indptr buffers referenced by
+                # any CUDA graph that captures its plan/run.  There is no
+                # callback here when such a graph is destroyed, so dropping
+                # the wrapper can leave graph replay with dangling pointers.
+                logger.warning_once(
+                    "TurboQuant FlashInfer prefill plan cache eviction is "
+                    "disabled when CUDA-graph-safe wrappers are enabled; "
+                    "set VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE=0 "
+                    "to allow bounded wrapper caching"
+                )
+            elif len(_TQ_FI_PREFILL_WRAPPERS) >= _TQ_FI_PREFILL_PLAN_CACHE_MAXSIZE:
+                # Evict before constructing/planning the replacement.  The
+                # wrapper owns an auxiliary GPU workspace, so evicting after
+                # planning briefly requires maxsize + 1 workspaces and can
+                # OOM at the exact point this bound is meant to protect.
+                _TQ_FI_PREFILL_WRAPPERS.popitem(last=False)
+
             workspace = _get_shared_flashinfer_prefill_workspace(
                 norm_device, self._fi_prefill_backend
             )
@@ -660,6 +786,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             )
             wrapper.plan(**plan_kwargs)
             _TQ_FI_PREFILL_WRAPPERS[cache_key] = wrapper
+        else:
+            _TQ_FI_PREFILL_WRAPPERS.move_to_end(cache_key)
         return wrapper
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
@@ -731,8 +859,21 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         if block_size <= 0:
             block_size = max_batched_tokens
 
+        # Continuation prefill dequantizes the complete cached prefix into the
+        # shared workspace.  Reserving only max_num_batched_tokens is not
+        # sufficient for long-context profiles: the workspace is locked before
+        # the first request and cannot grow when a 128K/256K prefix arrives.
+        # Use max_model_len as the default bound, while retaining the env var
+        # as an explicit lower bound for deployments with a smaller route.
+        model_cfg = getattr(vllm_config, "model_config", None)
+        max_model_len = int(
+            getattr(model_cfg, "max_model_len", 0) if model_cfg is not None else 0
+        )
+        configured_reserve = _TQ_CONTINUATION_WORKSPACE_RESERVE_TOKENS
         reserve_tokens = max(
-            max_batched_tokens, _TQ_CONTINUATION_WORKSPACE_RESERVE_TOKENS
+            max_batched_tokens,
+            max_model_len,
+            configured_reserve,
         )
         reserve_cached_len = math.ceil(reserve_tokens / block_size) * block_size
         if reserve_cached_len <= 0:
@@ -1081,15 +1222,22 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             layer
         )
         if attn_metadata.force_spec_decode:
-            attn_out = self._spec_decode_attention(
-                q,
-                kv_cache,
-                attn_metadata,
-                Pi,
-                centroids,
-                PiT,
-                layer,
-            )
+            if _TQ_FORCE_DECODE_SDPA:
+                k = key[:N].view(N, self.num_kv_heads, self.head_size)
+                v = value[:N].view(N, self.num_kv_heads, self.head_size)
+                attn_out = self._spec_decode_attention_sdpa_fallback(
+                    q, k, v, kv_cache, attn_metadata, Pi, centroids, layer
+                )
+            else:
+                attn_out = self._spec_decode_attention(
+                    q,
+                    kv_cache,
+                    attn_metadata,
+                    Pi,
+                    centroids,
+                    PiT,
+                    layer,
+                )
             if output.ndim == 3:
                 output[:N] = attn_out.to(output.dtype)
             else:
@@ -1183,11 +1331,53 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     else None
                 ),
                 num_actual_tokens=num_decode_tokens,
-                max_query_len=1,
+                max_query_len=max(
+                    attn_metadata.query_start_loc_cpu[i + 1].item()
+                    - attn_metadata.query_start_loc_cpu[i].item()
+                    for i in range(num_decodes)
+                ),
                 max_seq_len=attn_metadata.max_seq_len,
                 is_prefill=False,
             )
-            if use_decode_sdpa or use_shared_draft_decode_sdpa:
+            if decode_meta.max_query_len > 1:
+                if _TQ_DEBUG_MIXED:
+                    logger.warning(
+                        "TurboQuant mixed decode spec-path: num_decode_tokens=%s "
+                        "num_decodes=%s decode_max_query=%s",
+                        num_decode_tokens,
+                        num_decodes,
+                        decode_meta.max_query_len,
+                    )
+                if _TQ_FORCE_DECODE_SDPA:
+                    k_dec = key[:num_decode_tokens].view(
+                        num_decode_tokens, self.num_kv_heads, self.head_size
+                    )
+                    v_dec = value[:num_decode_tokens].view(
+                        num_decode_tokens, self.num_kv_heads, self.head_size
+                    )
+                    attn_out[:num_decode_tokens] = (
+                        self._spec_decode_attention_sdpa_fallback(
+                            q[:num_decode_tokens],
+                            k_dec,
+                            v_dec,
+                            kv_cache,
+                            decode_meta,
+                            Pi,
+                            centroids,
+                            layer,
+                        )
+                    )
+                else:
+                    attn_out[:num_decode_tokens] = self._spec_decode_attention(
+                        q[:num_decode_tokens],
+                        kv_cache,
+                        decode_meta,
+                        Pi,
+                        centroids,
+                        PiT,
+                        layer,
+                    )
+            elif use_decode_sdpa or use_shared_draft_decode_sdpa:
                 k_dec = key[:num_decode_tokens].view(
                     num_decode_tokens, self.num_kv_heads, self.head_size
                 )
@@ -1221,11 +1411,32 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # first-chunk prefills. Using full-batch max_seq_len breaks
             # this because decode requests inflate max_seq_len.
             prefill_seq_lens = attn_metadata.seq_lens[num_decodes:]
+            prefill_query_lens_cpu = (
+                attn_metadata.query_start_loc_cpu[num_decodes + 1 :]
+                - attn_metadata.query_start_loc_cpu[num_decodes:-1]
+            )
             # Use CPU-side max to avoid GPU→CPU sync from .item()
             prefill_max_seq = max(attn_metadata.seq_lens[num_decodes:].tolist())
+            prefill_max_query = max(prefill_query_lens_cpu.tolist())
             prefill_qsl = (
                 attn_metadata.query_start_loc[num_decodes:] - num_decode_tokens
             )
+            if _TQ_DEBUG_MIXED:
+                logger.warning(
+                    "TurboQuant mixed batch: N=%s num_decodes=%s "
+                    "num_decode_tokens=%s decode_max_query=%s "
+                    "prefill_reqs=%s prefill_max_query=%s "
+                    "prefill_max_seq=%s full_max_query=%s full_max_seq=%s",
+                    N,
+                    num_decodes,
+                    num_decode_tokens,
+                    decode_meta.max_query_len,
+                    prefill_seq_lens.shape[0],
+                    prefill_max_query,
+                    prefill_max_seq,
+                    attn_metadata.max_query_len,
+                    attn_metadata.max_seq_len,
+                )
             prefill_meta = TurboQuantMetadata(
                 seq_lens=prefill_seq_lens,
                 seq_lens_cpu=attn_metadata.seq_lens_cpu[num_decodes:],
@@ -1242,7 +1453,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     else None
                 ),
                 num_actual_tokens=N - num_decode_tokens,
-                max_query_len=attn_metadata.max_query_len,
+                max_query_len=prefill_max_query,
                 max_seq_len=prefill_max_seq,
                 is_prefill=True,
             )
@@ -1299,8 +1510,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 continue
 
             rel_seq_lens = _ac[1 : q_len + 1]
-            synth_seq_lens = attn_metadata.seq_lens[i : i + 1] - q_len + rel_seq_lens
-            synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
+            synth_seq_lens = (
+                attn_metadata.seq_lens[i : i + 1] - q_len + rel_seq_lens
+            ).contiguous()
+            synth_bt = (
+                attn_metadata.block_table[i : i + 1]
+                .expand(q_len, -1)
+                .contiguous()
+            )
             output[q_start:q_end] = triton_turboquant_decode_attention(
                 query=query[q_start:q_end],
                 kv_cache=kv_cache,
@@ -1315,10 +1532,153 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 key_fp8=self.tq_config.key_fp8,
                 norm_correction=self.tq_config.norm_correction,
                 PiT=PiT,
+                max_num_kv_splits=self.max_num_kv_splits,
                 sliding_window=self._decode_sliding_window,
             ).to(query.dtype)
 
         return output
+
+    def _spec_decode_attention_sdpa_fallback(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TurboQuantMetadata,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        layer: Any,
+    ) -> torch.Tensor:
+        _, Hq, _ = query.shape
+        Hk = key.shape[1]
+        qsl = attn_metadata.query_start_loc_cpu.tolist()
+        seq_lens = attn_metadata.seq_lens_cpu.tolist()
+        output = torch.empty_like(query)
+
+        for i, seq_len in enumerate(seq_lens):
+            q_start = qsl[i]
+            q_end = qsl[i + 1]
+            q_len = q_end - q_start
+            if q_len <= 0:
+                continue
+
+            seq_len = int(seq_len)
+            cached_len = max(seq_len - q_len, 0)
+            q_seq = query[q_start:q_end]
+            k_seq = key[q_start:q_end]
+            v_seq = value[q_start:q_end]
+            if cached_len == 0:
+                q_t = q_seq.transpose(0, 1).contiguous()
+                k_t = k_seq.transpose(0, 1).contiguous()
+                v_t = v_seq.transpose(0, 1).contiguous()
+                out = F.scaled_dot_product_attention(
+                    q_t,
+                    k_t,
+                    v_t,
+                    is_causal=True,
+                    scale=self.scale,
+                    enable_gqa=(Hk < Hq),
+                ).transpose(0, 1)
+            else:
+                out = self._continuation_prefill(
+                    layer,
+                    q_seq,
+                    k_seq,
+                    v_seq,
+                    kv_cache,
+                    attn_metadata.block_table[i : i + 1],
+                    cached_len,
+                    seq_len,
+                    Pi,
+                    centroids,
+                    force_sdpa=True,
+                )
+            output[q_start:q_end] = out.to(query.dtype)
+
+        return output
+
+    def _spec_continuation_decode_attention(
+        self,
+        query: torch.Tensor,
+        key_chunk: torch.Tensor,
+        value_chunk: torch.Tensor,
+        kv_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        cached_len: int,
+        Pi: torch.Tensor,
+        centroids: torch.Tensor,
+        PiT: torch.Tensor | None,
+        arange_cache: torch.Tensor,
+    ) -> torch.Tensor | None:
+        """Fast continuation attention for small MTP chunks.
+
+        The cached prefix can be read through the TQ decode kernel, but the
+        current chunk must use the uncompressed K/V produced in this step.
+        Reading the current chunk back from the quantized cache corrupts
+        multi-token speculative continuation quality.
+        """
+        if cached_len <= 0 or self._decode_sliding_window > 0:
+            return None
+
+        q_len, Hq, D = query.shape
+        Hk = key_chunk.shape[1]
+        if Hq % Hk != 0:
+            return None
+
+        # Prefix attention from compressed cache. All queries in this chunk see
+        # the same cached prefix; causal masking for current tokens is handled
+        # below on the raw current K/V.
+        prefix_seq_lens = torch.full(
+            (q_len,),
+            cached_len,
+            dtype=arange_cache.dtype,
+            device=query.device,
+        )
+        prefix_bt = block_table.expand(q_len, -1).contiguous()
+        prefix_lse = torch.empty(q_len, Hq, dtype=torch.float32, device=query.device)
+        prefix_out = triton_turboquant_decode_attention(
+            query=query,
+            kv_cache=kv_cache,
+            block_table=prefix_bt,
+            seq_lens=prefix_seq_lens,
+            Pi=Pi,
+            centroids=centroids,
+            scale=self.scale,
+            mse_bits=self.tq_config.key_mse_bits,
+            key_packed_size=self.tq_config.key_packed_size,
+            value_quant_bits=self.tq_config.effective_value_quant_bits,
+            key_fp8=self.tq_config.key_fp8,
+            norm_correction=self.tq_config.norm_correction,
+            PiT=PiT,
+            output_buf=torch.empty_like(query),
+            lse_buf=prefix_lse,
+            max_num_kv_splits=self.max_num_kv_splits,
+            sliding_window=self._decode_sliding_window,
+        )
+
+        # Current chunk attention from raw K/V. This is tiny for MTP
+        # continuation (typically q_len <= 8), so torch SDPA-style math is fast
+        # enough and avoids quantizing the just-produced K/V before use.
+        kv_group_size = Hq // Hk
+        q_float = query.float().view(q_len, Hk, kv_group_size, D)
+        k_float = key_chunk.float()
+        v_float = value_chunk.float()
+        scores = torch.einsum("thgd,shd->thgs", q_float, k_float) * self.scale
+        idx = torch.arange(q_len, device=query.device)
+        causal = idx.view(q_len, 1, 1, 1) >= idx.view(1, 1, 1, q_len)
+        scores = scores.masked_fill(~causal, float("-inf"))
+        current_lse = torch.logsumexp(scores, dim=-1).reshape(q_len, Hq)
+        probs = torch.softmax(scores, dim=-1)
+        current_out = torch.einsum("thgs,shd->thgd", probs, v_float)
+        current_out = current_out.reshape(q_len, Hq, D)
+
+        combined_lse = torch.logaddexp(prefix_lse, current_lse)
+        prefix_weight = torch.exp(prefix_lse - combined_lse).unsqueeze(-1)
+        current_weight = torch.exp(current_lse - combined_lse).unsqueeze(-1)
+        return (
+            prefix_out.float() * prefix_weight
+            + current_out.float() * current_weight
+        ).to(query.dtype)
 
     # ------------------------------------------------------------------ #
     #  Store K/V into combined cache (vectorized)                         #
@@ -1554,6 +1914,16 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 # avoid O(cached_len) full-dequant per continuation.
                 # For large continuations, fall back to _continuation_prefill.
                 cached_len = seq_len - q_len
+                if _TQ_DEBUG_MIXED:
+                    logger.warning(
+                        "TurboQuant continuation chunk: req=%s q_len=%s "
+                        "seq_len=%s cached_len=%s kv_dim=%s",
+                        i,
+                        q_len,
+                        seq_len,
+                        cached_len,
+                        kv_cache.dim(),
+                    )
                 if (
                     q_len <= _CONTINUATION_DECODE_THRESHOLD
                     and kv_cache.dim() == 5
@@ -1588,30 +1958,67 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     out = torch.cat(pieces, dim=0)
                 elif (
                     _SPEC_CONTINUATION_DECODE_FASTPATH
+                    and not _TQ_FORCE_CONTINUATION_SDPA
                     and q_len <= _CONTINUATION_DECODE_THRESHOLD
                     and kv_cache.dim() != 5
                 ):
-                    # Fast path: treat each query as a decode request
-                    # with incremental seq_lens for causal masking.
-                    # Slice from pre-built arange (no kernel launch)
-                    synth_seq_lens = _arange_cache[cached_len + 1 : seq_len + 1]
-                    synth_bt = attn_metadata.block_table[i : i + 1].expand(q_len, -1)
-                    out = triton_turboquant_decode_attention(
-                        query=q_seq,
-                        kv_cache=kv_cache,
-                        block_table=synth_bt,
-                        seq_lens=synth_seq_lens,
-                        Pi=Pi,
-                        centroids=centroids,
-                        scale=self.scale,
-                        mse_bits=self.tq_config.key_mse_bits,
-                        key_packed_size=self.tq_config.key_packed_size,
-                        value_quant_bits=(self.tq_config.effective_value_quant_bits),
-                        key_fp8=self.tq_config.key_fp8,
-                        norm_correction=self.tq_config.norm_correction,
-                        PiT=PiT,
-                        sliding_window=self._decode_sliding_window,
-                    )
+                    if q_len == 1:
+                        # Single-token continuation is equivalent to decode;
+                        # keep the original direct TQ decode path.
+                        synth_seq_lens = _arange_cache[
+                            cached_len + 1 : seq_len + 1
+                        ].contiguous()
+                        synth_bt = (
+                            attn_metadata.block_table[i : i + 1]
+                            .expand(q_len, -1)
+                            .contiguous()
+                        )
+                        out = triton_turboquant_decode_attention(
+                            query=q_seq,
+                            kv_cache=kv_cache,
+                            block_table=synth_bt,
+                            seq_lens=synth_seq_lens,
+                            Pi=Pi,
+                            centroids=centroids,
+                            scale=self.scale,
+                            mse_bits=self.tq_config.key_mse_bits,
+                            key_packed_size=self.tq_config.key_packed_size,
+                            value_quant_bits=(
+                                self.tq_config.effective_value_quant_bits
+                            ),
+                            key_fp8=self.tq_config.key_fp8,
+                            norm_correction=self.tq_config.norm_correction,
+                            PiT=PiT,
+                            max_num_kv_splits=self.max_num_kv_splits,
+                            sliding_window=self._decode_sliding_window,
+                        )
+                    else:
+                        out = self._spec_continuation_decode_attention(
+                            q_seq,
+                            k_seq,
+                            v_seq,
+                            kv_cache,
+                            attn_metadata.block_table[i : i + 1],
+                            cached_len,
+                            Pi,
+                            centroids,
+                            PiT,
+                            _arange_cache,
+                        )
+                        if out is None:
+                            out = self._continuation_prefill(
+                                layer,
+                                q_seq,
+                                k_seq,
+                                v_seq,
+                                kv_cache,
+                                attn_metadata.block_table[i : i + 1],
+                                cached_len,
+                                seq_len,
+                                Pi,
+                                centroids,
+                                force_sdpa=_TQ_FORCE_CONTINUATION_SDPA,
+                            )
                 else:
                     # Large continuation: dequant cached K/V and use
                     # flash_attn for better throughput.
@@ -1626,7 +2033,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         seq_len,
                         Pi,
                         centroids,
-                        force_sdpa=False,
+                        force_sdpa=_TQ_FORCE_CONTINUATION_SDPA,
                     )
                 output[q_start:q_end] = out.to(query.dtype)
 
@@ -1654,6 +2061,14 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         q_len, Hq, D = query.shape
         Hk = key_chunk.shape[1]
         device = query.device
+        prefix_combine_enabled = (
+            _tq_continuation_prefix_combine_enabled(seq_len)
+            and not force_sdpa
+            and kv_cache.dim() != 5
+            and cached_len > 0
+            and self._prefill_sliding_window <= 0
+            and self._use_flashinfer_for_continuation(q_len)
+        )
         if kv_cache.dim() == 5:
             triton_out = self._shared_fp16_decode_triton(
                 query,
@@ -1730,9 +2145,9 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
             # Reuse cached buffers to avoid per-call allocation (~16MB at 8K).
             alloc_len = math.ceil(cached_len / block_size) * block_size
             buf_shape = (1, Hk, alloc_len, D)
-            # Use WorkspaceManager for dequant buffers.
-            # Shared across all layers — saves 60× memory at long context.
-            # Required for CUDA Graph capture (per-layer growth incompatible with CG).
+            # Keep continuation dequant buffers on WorkspaceManager even for
+            # prefix-combine so long-prefix runs avoid allocator churn and stay
+            # compatible with the shared graph/workspace policy.
             k_buf, v_buf = current_workspace_manager().get_simultaneous(
                 (buf_shape, torch.float16),
                 (buf_shape, torch.float16),
@@ -1811,7 +2226,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 KEY_FP8=1 if self.tq_config.key_fp8 else 0,
                 BLOCK_D=BLOCK_D,
                 NORM_CORRECTION=1 if self.tq_config.norm_correction else 0,
-                FP8_E4B15=_use_fp8_e4b15(device.index or 0),
+                FP8_FORMAT=_fp8_format_code(device.index or 0),
                 num_warps=4,
             )
 
@@ -1847,6 +2262,140 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                     "Unsupported shared KV head mapping: "
                     f"cached_hk={cached_hk}, layer_hk={Hk}, D={D}"
                 )
+
+        if prefix_combine_enabled:
+            if self._fi_single_qo_indptr_cpu is None:
+                self._fi_single_qo_indptr_cpu = torch.empty(
+                    2, dtype=torch.int32, pin_memory=True
+                )
+                self._fi_single_kv_indptr_cpu = torch.empty(
+                    2, dtype=torch.int32, pin_memory=True
+                )
+
+            self._fi_single_qo_indptr_cpu[0] = 0
+            self._fi_single_qo_indptr_cpu[1] = q_len
+            self._fi_single_kv_indptr_cpu[0] = 0
+            self._fi_single_kv_indptr_cpu[1] = cached_len
+            seq_lens_prefix = cached_len * torch.ones(1, dtype=torch.int32)
+            seq_lens_q = q_len * torch.ones(1, dtype=torch.int32)
+            prefix_plan_key = (
+                "continuation_prefix_combine_prefix",
+                Hq,
+                Hk,
+                D,
+                str(query.dtype),
+                str(k_cached_trim.dtype),
+                q_len,
+                cached_len,
+            )
+            prefix_wrapper = self._get_or_plan_flashinfer_prefill_wrapper(
+                device,
+                prefix_plan_key,
+                {
+                    "qo_indptr": self._flashinfer_indptr(
+                        self._fi_single_qo_indptr_cpu, Hq, D
+                    ),
+                    "kv_indptr": self._flashinfer_indptr(
+                        self._fi_single_kv_indptr_cpu, Hk, D
+                    ),
+                    "num_qo_heads": Hq,
+                    "num_kv_heads": Hk,
+                    "head_dim_qk": D,
+                    "causal": False,
+                    "window_left": -1,
+                    "sm_scale": self.scale,
+                    "pos_encoding_mode": "NONE",
+                    "q_data_type": query.dtype,
+                    "kv_data_type": k_cached_trim.dtype,
+                    "seq_lens": seq_lens_prefix,
+                    "seq_lens_q": seq_lens_q,
+                    "max_token_per_sequence": q_len,
+                    "max_sequence_kv": cached_len,
+                },
+            )
+            prefix_out = torch.empty_like(query)
+            prefix_lse = torch.empty(
+                (q_len, Hq), dtype=torch.float32, device=device
+            )
+            prefix_out, prefix_lse = prefix_wrapper.run(
+                query,
+                k_cached_trim,
+                v_cached_trim,
+                out=prefix_out,
+                lse=prefix_lse,
+                return_lse=True,
+            )
+            del k_cached_trim, v_cached_trim, k_cached, v_cached, k_buf, v_buf
+
+            self._fi_single_kv_indptr_cpu[1] = q_len
+            seq_lens_current = q_len * torch.ones(1, dtype=torch.int32)
+            current_plan_key = (
+                "continuation_prefix_combine_current",
+                Hq,
+                Hk,
+                D,
+                str(query.dtype),
+                str(key_chunk.dtype),
+                q_len,
+            )
+            current_wrapper = self._get_or_plan_flashinfer_prefill_wrapper(
+                device,
+                current_plan_key,
+                {
+                    "qo_indptr": self._flashinfer_indptr(
+                        self._fi_single_qo_indptr_cpu, Hq, D
+                    ),
+                    "kv_indptr": self._flashinfer_indptr(
+                        self._fi_single_kv_indptr_cpu, Hk, D
+                    ),
+                    "num_qo_heads": Hq,
+                    "num_kv_heads": Hk,
+                    "head_dim_qk": D,
+                    "causal": True,
+                    "window_left": self._prefill_sliding_window,
+                    "sm_scale": self.scale,
+                    "pos_encoding_mode": "NONE",
+                    "q_data_type": query.dtype,
+                    "kv_data_type": key_chunk.dtype,
+                    "seq_lens": seq_lens_current,
+                    "seq_lens_q": seq_lens_q,
+                    "max_token_per_sequence": q_len,
+                    "max_sequence_kv": q_len,
+                },
+            )
+            current_out = torch.empty_like(query)
+            current_lse = torch.empty(
+                (q_len, Hq), dtype=torch.float32, device=device
+            )
+            current_out, current_lse = current_wrapper.run(
+                query,
+                key_chunk,
+                val_chunk,
+                out=current_out,
+                lse=current_lse,
+                return_lse=True,
+            )
+            prefix_lse_for_merge = prefix_lse.transpose(0, 1).contiguous()
+            current_lse_for_merge = current_lse.transpose(0, 1).contiguous()
+            merge_attn_states(
+                current_out,
+                prefix_out,
+                prefix_lse_for_merge,
+                current_out,
+                current_lse_for_merge,
+            )
+            del prefix_out, prefix_lse, current_lse
+            del prefix_lse_for_merge, current_lse_for_merge
+            logger.info_once(
+                "TurboQuant continuation prefix-combine path used: "
+                "mode=%s min_tokens=%s seq_len=%s cached_len=%s q_len=%s",
+                _TQ_CONTINUATION_PREFIX_COMBINE_MODE,
+                _TQ_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS,
+                seq_len,
+                cached_len,
+                q_len,
+            )
+            return current_out
 
         # Concatenate cached + current chunk K/V (match query dtype)
         # Pre-allocate full K/V buffer, copy into slices (no cat alloc)
@@ -1951,10 +2500,25 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                 return out.unsqueeze(0).to(query.dtype)
 
             q_chunk = _TQ_CONTINUATION_SDPA_Q_CHUNK
-            if q_chunk > 0 and _TQ_CONTINUATION_SDPA_MAX_QK_CELLS > 0:
+            qk_cap = _TQ_CONTINUATION_SDPA_MAX_QK_CELLS
+            if force_sdpa and _TQ_FORCE_DECODE_SDPA_MAX_QK_CELLS > 0:
+                qk_cap = (
+                    min(qk_cap, _TQ_FORCE_DECODE_SDPA_MAX_QK_CELLS)
+                    if qk_cap > 0
+                    else _TQ_FORCE_DECODE_SDPA_MAX_QK_CELLS
+                )
+            if force_sdpa and q_chunk <= 0:
+                q_chunk = max(
+                    1,
+                    min(
+                        q_len,
+                        qk_cap // max(seq_len, 1) if qk_cap > 0 else q_len,
+                    ),
+                )
+            if q_chunk > 0 and qk_cap > 0:
                 capped_q_chunk = max(
                     1,
-                    min(q_chunk, _TQ_CONTINUATION_SDPA_MAX_QK_CELLS // max(seq_len, 1)),
+                    min(q_chunk, qk_cap // max(seq_len, 1)),
                 )
                 if capped_q_chunk < q_chunk:
                     logger.info_once(
@@ -1962,7 +2526,7 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
                         "requested=%d effective=%d max_qk_cells=%d seq_len=%d",
                         q_chunk,
                         capped_q_chunk,
-                        _TQ_CONTINUATION_SDPA_MAX_QK_CELLS,
+                        qk_cap,
                         seq_len,
                     )
                     q_chunk = capped_q_chunk
@@ -2032,6 +2596,8 @@ class TurboQuantAttentionImpl(AttentionImpl["TurboQuantMetadata"]):
         return shared_target is not None
 
     def _use_decode_sdpa_fallback(self) -> bool:
+        if _TQ_FORCE_DECODE_SDPA:
+            return True
         if _GEMMA4_TQ_DECODE_D256_SDPA_FALLBACK and self.head_size >= 256:
             return True
         return _GEMMA4_TQ_DECODE_D512_SDPA_FALLBACK and self.head_size >= 512

@@ -3,6 +3,121 @@
 This changelog tracks the fork release version for vLLM 2080 Ti Definitive
 Edition. It is separate from the upstream vLLM package version.
 
+## v0.1.17 - 2026-08-24
+
+- Merges [PR #125](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/125), deduplicating named-tool streaming fallback output and preserving `finish_reason=length` for truncated tool calls.
+- Merges [PR #128](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/128), disabling implicit repetition detection for tool-call arguments by default so valid repeated Markdown or code is not truncated.
+- Merges [PR #129](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/129), emitting Qwen XML function names once per tool call and omitting repeated `name` fields from continuation deltas.
+- Merges [PR #130](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/130), making Qwen XML close-tag recovery call-scoped, cross-chunk safe, and bounded for long streamed arguments.
+- Merges [PR #132](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/132), bounding the TurboQuant FlashInfer prefill wrapper cache while preserving CUDA Graph-safe wrapper lifetimes.
+- Merges [PR #133](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/133), re-aligning Mamba offload hit boundaries after per-group clamps to preserve hybrid KV state consistency.
+- Merges [PR #134](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/134), reserving TurboQuant continuation workspace for the configured maximum context before KV-cache sizing.
+- Release credit: @kevinhirsch and @weicj.
+
+## v0.1.16 - 2026-08-20
+
+- Merges [PR #101](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/101), bounding Qwen reasoning blocks without dropping split markers.
+- Merges [PR #108](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/108), disabling custom all-reduce during CUDA Graph profiling to avoid the SM75 128K IPC leak path.
+- Merges [PR #111](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/111), reserving TurboQuant continuation-prefill workspace before KV-cache sizing to avoid high-context Xid 31 crashes.
+- Merges [PR #116](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/116), preventing `None` function names in Qwen3 XML streaming tool-call chunks.
+- Merges [PR #120](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/120), adding interactive and non-interactive TP/PP layout selection to the 0.1.x launcher with GPU-factorization validation.
+- Release credit: @YuYue1208, @superniker, @kevinhirsch, @hotwa, and @weicj.
+
+## v0.1.15 - 2026-08-15
+
+- Validates the official
+  [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8) checkpoint
+  end to end on the dual RTX 2080 Ti TP=2 runtime. The Qwen3.x 27B FP8 route
+  now explicitly covers official Qwen3.6 and Qwen3.8 checkpoints.
+- Merges [PR #85](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/85),
+  improving build download-route preflight, PyTorch fallback
+  behavior, and automatic `MAX_JOBS` limits for reliable source builds.
+- Merges [PR #89](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/89),
+  preserving hybrid Mamba prefix-cache correctness when MTP
+  speculative decoding is enabled.
+- Merges [PR #91](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/91),
+  adding native CPU KV offload support for the Mamba align
+  cache path.
+- Merges [PR #93](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/93),
+  preserving the GDN causal-convolution state slot zero during
+  SM75 decode and adding its regression coverage.
+- Merges [PR #98](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/98),
+  completing named tool-choice response handling for full and
+  streaming OpenAI-compatible chat completions, including Mistral-compliant
+  IDs and empty-argument handling.
+- Release credit: @weicj, @YuYue1208, and @0xYYP.
+
+## v0.1.14 - 2026-07-07
+
+- Merges [PR #78](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/78),
+  improving the validated SM75 TurboQuant long-context route with
+  the tested continuation prefix-combine path, tuned decode `BLOCK_KV=2`
+  defaults, reproducible long-context benchmark controls, and launcher/runtime
+  plumbing for the shipped TurboQuant throughput lane.
+- Merges [PR #81](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/81),
+  finalizing the non-interactive launcher override path with
+  explicit `CLI > ENV > PROFILE > default` precedence, `CUDA_VISIBLE_DEVICES`
+  mapping, mode-derived override hygiene, and matching English / Simplified
+  Chinese launcher documentation.
+- Release credit: @0xYYP and @weicj.
+
+## v0.1.13 - 2026-07-04
+
+- Merges [PR #71](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/71),
+  fixing the SM75 TurboQuant TQK8V4 FP8 key-format path and the
+  launcher submenu numeric-selection regression.
+- Merges [PR #72](https://github.com/weicj/vLLM-2080Ti-Definitive/pull/72),
+  adding the first validated Docker runtime packaging path for
+  the SM75 fork, including the runtime Dockerfile, compose example, entrypoint
+  flow, and packaged helper assets needed to launch the shipped profiles
+  inside a container.
+- Extends the merged Docker path with the validated host-side `docker/build.sh`
+  wrapper so Docker builds follow the repository `build.sh` behavior for
+  automatic `MAX_JOBS` selection, download-route preflight, and consistent
+  PyPI/Git mirror propagation through Docker and compose builds.
+- Release credit: @0xYYP and @hotwa.
+
+## v0.1.12 - 2026-07-02
+
+- Integrates the SM75 custom all-reduce graph-input auto policy so the official
+  Qwen3.6 35B FP8 release route can keep the validated fast decode path while
+  avoiding the PIECEWISE graph-capture startup crash.
+- Finalizes the current build/install reliability fixes, including safer build
+  parallelism defaults, broken virtualenv self-heal, dependency checkout reuse,
+  and rebuild recovery for fresh source installs.
+- Adds the validated official Qwen3.6 35B FP8 profile set: 256K text-only
+  `normal` and `aggressive`, 136K text+image `normal` and `aggressive`, and a
+  178K `fast` MTP3 route.
+- Fixes the shipped Qwen3.6 27B `fast` TQK8V4 256K prefix-cache continuation
+  route by promoting the validated `GPU_UTIL=0.96` profile values and making
+  the launcher auto-reserve the larger continuation workspace for long
+  single-sequence TurboQuant lanes.
+
+## v0.1.11 - 2026-06-29
+
+- Updates the launcher defaults for long-context serving: prefix cache is now a
+  launcher-level default, prompt token details are enabled for status
+  visibility, and Qwen routes automatically use the cache mode required by the
+  validated prefix-cache path.
+- Adds launcher-side startup safeguards for large profiles, including
+  cold-compile prewarm retry and display-GPU occupancy warnings.
+- Retunes the shipped Qwen3.6 TQK8V4 `fast` profiles for the validated prefix
+  cache path by raising their max batched tokens to `2560`.
+
+## v0.1.10 - 2026-06-17
+
+- Fixes the Qwen reasoning startup path by keeping `reasoning_content`
+  compatible with clients that still read the legacy field name.
+- Unifies chat reasoning and tool-call parsing so `content=None` responses do
+  not break named tool choice handling, and adds regression coverage for the
+  reasoning-only null-content path.
+- Fixes Qwen GDN mixed prefill/decode handling when mixed batches transition
+  through the recurrent attention path, including the TurboQuant attention state
+  handling needed by that route.
+- Adds the explicit GDN prefill metadata used by the validated mixed
+  prefill/decode path, and re-validates the FP8 FP16-KV 128K MTP3 route on
+  dual RTX 2080 Ti.
+
 ## v0.1.9 - 2026-06-15
 
 - Restores the validated Qwen3.6 27B FP8 + TurboQuant TQK8V4 `fast` route on
@@ -112,9 +227,4 @@ Edition. It is separate from the upstream vLLM package version.
 
 ## v0.1.1
 
-- Follow-up compatibility fixes for editable/source builds and optional CUDA
-  extension imports on SM75 environments.
-
-## v0.1.0
-
-- Initial public stable snapshot of the dual 2080 Ti / SM75 TP=2 runtime.
+- Follow-up compatibility fixes for editable/source bu

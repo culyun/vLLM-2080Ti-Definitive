@@ -268,7 +268,14 @@ class DeltaMessage(OpenAIBaseModel):
     role: str | None = None
     content: str | None = None
     reasoning: str | None = None
+    reasoning_content: str | None = None
     tool_calls: list[DeltaToolCall] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def sync_reasoning_content(self):
+        if self.reasoning is not None and self.reasoning_content is None:
+            self.reasoning_content = self.reasoning
+        return self
 
 
 class GenerationError(Exception):

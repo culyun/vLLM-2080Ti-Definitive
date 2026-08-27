@@ -15,7 +15,7 @@ import math
 import torch
 
 from vllm.triton_utils import tl, triton
-from vllm.v1.attention.ops.triton_turboquant_decode import _use_fp8_e4b15
+from vllm.v1.attention.ops.triton_turboquant_decode import _fp8_format_code
 
 # ═══════════════════════════════════════════════════════════════════════
 # Shared: value uniform quantization + pack + scale/zero store
@@ -164,7 +164,7 @@ def _tq_fused_store_fp8(
     # Packing block sizes
     BLOCK_VAL: tl.constexpr,
     BLOCK_GRP: tl.constexpr = 16,
-    FP8_E4B15: tl.constexpr = 0,  # 1 = e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    FP8_FORMAT: tl.constexpr = 0,  # 0=e4nv, 1=e4b15, 2=e5
 ):
     """FP8 key cast+scatter + value uniform quantization."""
     pid = tl.program_id(0)
@@ -189,7 +189,12 @@ def _tq_fused_store_fp8(
     d_offs = tl.arange(0, BLOCK_D)
     d_mask = d_offs < D
     k_vals = tl.load(Key_ptr + base + d_offs, mask=d_mask, other=0.0)
-    k_fp8 = k_vals.to(tl.float8e4b15) if FP8_E4B15 else k_vals.to(tl.float8e4nv)
+    if FP8_FORMAT == 1:
+        k_fp8 = k_vals.to(tl.float8e4b15)
+    elif FP8_FORMAT == 2:
+        k_fp8 = k_vals.to(tl.float8e5)
+    else:
+        k_fp8 = k_vals.to(tl.float8e4nv)
     k_bytes = k_fp8.to(tl.uint8, bitcast=True)
     tl.store(KV_cache_ptr + slot_base + d_offs, k_bytes, mask=d_mask)
 
@@ -383,7 +388,7 @@ def triton_turboquant_store(
         k_flat = key.reshape(NH, D).contiguous()
         v_flat = value.reshape(NH, D).contiguous()
 
-        fp8_e4b15 = _use_fp8_e4b15(key.device.index or 0)
+        fp8_format = _fp8_format_code(key.device.index or 0)
 
         grid = (NH,)
         _tq_fused_store_fp8[grid](
@@ -403,7 +408,7 @@ def triton_turboquant_store(
             VAL_DATA_BYTES=val_data_bytes,
             BLOCK_VAL=BLOCK_VAL,
             BLOCK_GRP=block_grp,
-            FP8_E4B15=fp8_e4b15,
+            FP8_FORMAT=fp8_format,
             num_warps=4,
             num_stages=1,
         )

@@ -1,0 +1,84 @@
+# Local vLLM 2080 Ti runtime service.
+#
+# Build from repository root (recommended host preflight + compose frontend):
+#   ./docker/build.sh compose
+# Manual fallback:
+#   MAX_JOBS=4 docker compose -f docker/docker-compose.yml build vllm
+# Start:
+#   docker compose -f docker/docker-compose.yml up -d vllm
+
+services:
+  vllm:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+      args:
+        MAX_JOBS: ${MAX_JOBS:-4}
+        FLASHQLA_REPO: ${FLASHQLA_REPO:-https://github.com/weicj/FlashQLA-SM70-SM75.git}
+        FLASHQLA_REF: ${FLASHQLA_REF:-3ab27d77d8ca01d7a4718903b726add1a8886c0e}
+        BUILD_NETWORK_PREFLIGHT: ${BUILD_NETWORK_PREFLIGHT:-1}
+        BUILD_PREFLIGHT_SAMPLE_TIMEOUT_SECONDS: ${BUILD_PREFLIGHT_SAMPLE_TIMEOUT_SECONDS:-5}
+        BUILD_PYPI_OFFICIAL_INDEX: ${BUILD_PYPI_OFFICIAL_INDEX:-https://pypi.org/simple}
+        BUILD_PYPI_FOREIGN_INDEX: ${BUILD_PYPI_FOREIGN_INDEX:-https://pypi.python.org/simple}
+        BUILD_PYPI_DOMESTIC_INDEX: ${BUILD_PYPI_DOMESTIC_INDEX:-https://pypi.tuna.tsinghua.edu.cn/simple}
+        BUILD_PYPI_PRIMARY_TIMEOUT_SECONDS: ${BUILD_PYPI_PRIMARY_TIMEOUT_SECONDS:-60}
+        BUILD_PYPI_FALLBACK_TIMEOUT_SECONDS: ${BUILD_PYPI_FALLBACK_TIMEOUT_SECONDS:-}
+        BUILD_PYPI_MIRROR_INDEX: ${BUILD_PYPI_MIRROR_INDEX:-}
+        BUILD_PYPI_MIRROR_FALLBACK: ${BUILD_PYPI_MIRROR_FALLBACK:-1}
+        BUILD_WHEELHOUSE_DIR: ${BUILD_WHEELHOUSE_DIR:-}
+        BUILD_PYPI_ACTIVE_INDEX: ${BUILD_PYPI_ACTIVE_INDEX:-}
+        BUILD_DOWNLOAD_SELECTED_MODE: ${BUILD_DOWNLOAD_SELECTED_MODE:-}
+        BUILD_GIT_ACTIVE_PREFIX: ${BUILD_GIT_ACTIVE_PREFIX:-}
+        BUILD_GIT_FOREIGN_REPO_PREFIX: ${BUILD_GIT_FOREIGN_REPO_PREFIX:-https://gh-proxy.com/}
+        BUILD_GIT_DOMESTIC_REPO_PREFIX: ${BUILD_GIT_DOMESTIC_REPO_PREFIX:-https://ghfast.top/}
+        BUILD_GIT_OFFICIAL_PROBE: ${BUILD_GIT_OFFICIAL_PROBE:-}
+        BUILD_GIT_FOREIGN_PROBE: ${BUILD_GIT_FOREIGN_PROBE:-}
+        BUILD_GIT_DOMESTIC_PROBE: ${BUILD_GIT_DOMESTIC_PROBE:-}
+        BUILD_GIT_PRIMARY_TIMEOUT_SECONDS: ${BUILD_GIT_PRIMARY_TIMEOUT_SECONDS:-120}
+        BUILD_GIT_MIRROR_PREFIXES: ${BUILD_GIT_MIRROR_PREFIXES:-}
+        CUTLASS_REPO: ${CUTLASS_REPO:-https://github.com/nvidia/cutlass.git}
+        CUTLASS_REVISION: ${CUTLASS_REVISION:-da5e086dab31d63815acafdac9a9c5893b1c69e2}
+        TRITON_REPO: ${TRITON_REPO:-https://github.com/triton-lang/triton.git}
+        TRITON_TAG: ${TRITON_TAG:-7c56a5e40f7fd928dfd5c72902d5def0097db73a}
+    image: ${VLLM_IMAGE:-local/vllm-2080ti-definitive:v0.1.15}
+    container_name: ${VLLM_CONTAINER_NAME:-vllm-2080ti}
+    restart: unless-stopped
+    ipc: host
+    ports:
+      - "${VLLM_HOST_PORT:-8000}:8000"
+    volumes:
+      - ${MODEL_ROOT:-/data/models}:/models:ro
+      - vllm-torch-cache:/tmp/torch_extensions_cache
+      - vllm-triton-cache:/tmp/triton-cache
+      - vllm-inductor-cache:/tmp/torchinductor-cache
+    environment:
+      - MODEL_DIR=${MODEL_DIR:-/models/Qwen3.6-27B-GPTQ-Int4}
+      - PROFILE=${PROFILE:-qwen27b/fast/int4/tqk8v4-256K-mtp3-text-only.env}
+      - MODE=${MODE:-fast}
+      - PORT=8000
+      - SERVICE_SCOPE=${SERVICE_SCOPE:-lan}
+      - GPU_UTIL=${GPU_UTIL:-0.96}
+      - CHAT_TEMPLATE_FILE=/opt/vllm/docker/chat_template_no_thinking.jinja
+      - DEFAULT_CHAT_TEMPLATE_KWARGS={"enable_thinking":false}
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-0,1}
+      - NVIDIA_VISIBLE_DEVICES=${NVIDIA_VISIBLE_DEVICES:-0,1}
+      - TORCH_CUDA_ARCH_LIST=7.5
+      - CUDA_DEVICE_ORDER=PCI_BUS_ID
+      - FLASHINFER_ENABLE_AOT=1
+      - NCCL_DEBUG=WARN
+      - PYTHONUNBUFFERED=1
+    ulimits:
+      memlock: -1
+      stack: 67108864
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: ${GPU_COUNT:-2}
+              capabilities: [gpu]
+
+volumes:
+  vllm-torch-cache:
+  vllm-triton-cache:
+  vllm-inductor-cache:

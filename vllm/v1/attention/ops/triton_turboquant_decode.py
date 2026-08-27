@@ -9,6 +9,7 @@ Supports FP8 (E4M3) keys, 3-bit and 4-bit uniform quantized values.
 """
 
 import math
+import os
 from typing import Any
 
 import torch
@@ -19,20 +20,73 @@ from vllm.v1.attention.ops.triton_decode_attention import (
     _fwd_kernel_stage2,
 )
 
-_FP8_E4B15: dict[int, int] = {}
+_FP8_FORMAT_CODE: dict[int, int] = {}
+_FP8_FORMAT_OVERRIDE = os.getenv(
+    "VLLM_TURBOQUANT_K8V4_FP8_FORMAT",
+    "auto",
+).strip().lower()
+if _FP8_FORMAT_OVERRIDE not in ("", "auto", "e4b15", "e4nv", "e5"):
+    raise ValueError(
+        "VLLM_TURBOQUANT_K8V4_FP8_FORMAT must be one of: "
+        "auto, e4b15, e4nv, e5"
+    )
+
+
+def _read_decode_block_kv() -> int:
+    value = os.getenv("VLLM_TURBOQUANT_DECODE_BLOCK_KV", "2").strip()
+    try:
+        block_kv = int(value)
+    except ValueError as err:
+        raise ValueError(
+            "VLLM_TURBOQUANT_DECODE_BLOCK_KV must be one of: 1, 2, 4, 8, 16"
+        ) from err
+    if block_kv not in (1, 2, 4, 8, 16):
+        raise ValueError(
+            "VLLM_TURBOQUANT_DECODE_BLOCK_KV must be one of: 1, 2, 4, 8, 16"
+        )
+    return block_kv
+
+
+_DECODE_BLOCK_KV = _read_decode_block_kv()
+
+
+def _fp8_format_code(device: int = 0) -> int:
+    """Return 0=e4nv, 1=e4b15, 2=e5 for TQ raw FP8 key kernels."""
+    if _FP8_FORMAT_OVERRIDE == "e4b15":
+        return 1
+    if _FP8_FORMAT_OVERRIDE == "e5":
+        return 2
+    if _FP8_FORMAT_OVERRIDE == "e4nv":
+        if current_platform.is_cuda_alike():
+            cap = torch.cuda.get_device_capability(device)
+            if cap < (8, 9):
+                raise ValueError(
+                    "VLLM_TURBOQUANT_K8V4_FP8_FORMAT=e4nv is not supported "
+                    f"on CUDA capability {cap[0]}.{cap[1]}; Triton supports "
+                    "e4b15 and e5 on this architecture."
+                )
+        return 0
+    if device not in _FP8_FORMAT_CODE:
+        if current_platform.is_cuda_alike():
+            cap = torch.cuda.get_device_capability(device)
+            if cap < (8, 0):
+                # SM75/Turing supports fp8e5 and fp8e4b15 in Triton. Raw
+                # post-RoPE Qwen3.6 keys need the wider e5 range; e4b15
+                # severely degrades long-context retrieval quality.
+                _FP8_FORMAT_CODE[device] = 2
+            else:
+                _FP8_FORMAT_CODE[device] = 1 if cap < (8, 9) else 0
+        else:
+            _FP8_FORMAT_CODE[device] = 0
+    return _FP8_FORMAT_CODE[device]
+
+
+def _fp8_format_name(device: int = 0) -> str:
+    return ("e4nv", "e4b15", "e5")[_fp8_format_code(device)]
 
 
 def _use_fp8_e4b15(device: int = 0) -> int:
-    """Return 1 if device needs fp8e4b15 (Ampere/Ada, SM < 8.9), else 0.
-    On non-CUDA platforms (e.g. XPU), always returns 0 (use e4nv format).
-    """
-    if device not in _FP8_E4B15:
-        if current_platform.is_cuda_alike():
-            cap = torch.cuda.get_device_capability(device)
-            _FP8_E4B15[device] = 1 if cap < (8, 9) else 0
-        else:
-            _FP8_E4B15[device] = 0
-    return _FP8_E4B15[device]
+    return 1 if _fp8_format_code(device) == 1 else 0
 
 
 # ---------------------------------------------------------------------------
@@ -83,7 +137,7 @@ def _tq_decode_stage1(
     BLOCK_KV: tl.constexpr,  # tokens per tile (16)
     KEY_FP8: tl.constexpr,  # 1 if K is stored as FP8
     NORM_CORRECTION: tl.constexpr = 0,  # 1 = re-normalize centroids
-    FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    FP8_FORMAT: tl.constexpr = 0,  # 0=e4nv, 1=e4b15, 2=e5
 ):
     bid = tl.program_id(0)  # batch index
     hid = tl.program_id(1)  # q_head index
@@ -166,8 +220,10 @@ def _tq_decode_stage1(
                 mask=kv_mask[:, None] & d_mask[None, :],
                 other=0,
             )
-            if FP8_E4B15:
+            if FP8_FORMAT == 1:
                 k_float = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
+            elif FP8_FORMAT == 2:
+                k_float = k_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
             else:
                 k_float = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
             scores = (
@@ -351,7 +407,7 @@ def _tq_full_dequant_kv(
     KEY_FP8: tl.constexpr,
     BLOCK_D: tl.constexpr,
     NORM_CORRECTION: tl.constexpr = 0,
-    FP8_E4B15: tl.constexpr = 0,  # 1 = use e4b15 (Ampere/Ada), 0 = e4nv (Hopper+)
+    FP8_FORMAT: tl.constexpr = 0,  # 0=e4nv, 1=e4b15, 2=e5
 ):
     """Full dequant: reconstruct K (MSE centroids * norm or FP8) and V to fp16."""
     pos = tl.program_id(0)
@@ -375,8 +431,10 @@ def _tq_full_dequant_kv(
     ko_base = bid * stride_ko_b + hid * stride_ko_h + pos * stride_ko_s
     if KEY_FP8:
         k_raw = tl.load(KV_cache_ptr + slot_base + d_offs, mask=d_mask, other=0)
-        if FP8_E4B15:
+        if FP8_FORMAT == 1:
             k_recon = k_raw.to(tl.float8e4b15, bitcast=True).to(tl.float32)
+        elif FP8_FORMAT == 2:
+            k_recon = k_raw.to(tl.float8e5, bitcast=True).to(tl.float32)
         else:
             k_recon = k_raw.to(tl.float8e4nv, bitcast=True).to(tl.float32)
         tl.store(K_out_ptr + ko_base + d_offs, k_recon.to(tl.float16), mask=d_mask)
@@ -555,8 +613,8 @@ def triton_turboquant_decode_attention(
             buf_holder._tq_mid_o_buf = mid_o
 
     # Stage 1: split-KV tiled attention scoring + value accumulation
-    fp8_e4b15 = _use_fp8_e4b15(device.index or 0)
-    BLOCK_KV = 4
+    fp8_format = _fp8_format_code(device.index or 0)
+    BLOCK_KV = _DECODE_BLOCK_KV
     grid = (B, Hq, NUM_KV_SPLITS)
     _tq_decode_stage1[grid](
         q_rot,
@@ -590,7 +648,7 @@ def triton_turboquant_decode_attention(
         BLOCK_KV=BLOCK_KV,
         KEY_FP8=1 if key_fp8 else 0,
         NORM_CORRECTION=1 if norm_correction else 0,
-        FP8_E4B15=fp8_e4b15,
+        FP8_FORMAT=fp8_format,
         num_warps=1,
         num_stages=1,
     )

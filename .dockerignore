@@ -1,0 +1,66 @@
+# Version control
+.git
+.github
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Build artifacts
+build/
+build-logs/
+dist/
+*.egg
+.deps/
+out/
+
+# Runtime caches
+triton-cache/
+torchinductor-cache/
+logs/
+run-logs/
+build-logs/
+.hf-cache/
+hf-cache/
+backups/
+/models/
+/deployments/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docs (not needed in image)
+docs/
+*.md
+!README.md
+
+# Local deployment/runtime artifacts. Keep deployment source files in git, but
+# never send downloaded models, local caches, venvs, or third-party clones to
+# the Docker build context.
+deployments/**/.env
+deployments/**/.hf-cache/
+deployments/**/hf-cache/
+deployments/**/.venv/
+deployments/**/models/
+deployments/**/repos/
+deployments/**/third_party/
+deployments/**/logs/
+deployments/**/artifacts/
+deployments/**/backups/
+deployments/**/mtp-poc/
+*.gguf
+*.safetensors
+*.bin
+*.pt
+*.pth

@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Final
 
 from fastapi import Request
 
+from vllm import envs
 from vllm.engine.protocol import EngineClient
 from vllm.entrypoints.chat_utils import (
     ChatTemplateContentFormatOption,
@@ -342,13 +343,13 @@ class OpenAIServingChat(OpenAIServing):
                 if (
                     _tool_calling_requested(request)
                     and sampling_params.repetition_detection is None
+                    and envs.VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT > 0
                 ):
                     sampling_params.repetition_detection = RepetitionDetectionParams(
                         max_pattern_size=32,
                         min_pattern_size=1,
-                        min_count=8,
+                        min_count=envs.VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT,
                     )
-
             self._log_inputs(
                 sub_request_id,
                 engine_input,
@@ -406,6 +407,14 @@ class OpenAIServingChat(OpenAIServing):
         assert len(generators) == 1
         (result_generator,) = generators
 
+        parser: Parser | None = None
+        if self.parser_cls is not None:
+            parser = self.parser_cls(
+                tokenizer,
+                request.tools,
+                chat_template_kwargs=chat_template_kwargs,
+            )
+
         if request.stream:
             return self.chat_completion_stream_generator(
                 request,
@@ -427,7 +436,7 @@ class OpenAIServingChat(OpenAIServing):
             conversation,
             tokenizer,
             request_metadata,
-            reasoning_parser,
+            parser,
         )
 
     def get_chat_request_role(self, request: ChatCompletionRequest) -> str:
@@ -482,6 +491,11 @@ class OpenAIServingChat(OpenAIServing):
             history_tool_call_cnt = get_history_tool_calls_cnt(conversation)
         else:
             history_tool_call_cnt = 0
+
+        # Tool-call ids for forced named tool choice are generated on demand by
+        # extract_named_tool_call_streaming() (shared with the model-parser
+        # path in vllm.parser.abstract_parser), so nothing is precomputed here.
+        named_tool_name_sent = [False] * num_choices
 
         # Always track previous_texts for comprehensive output logging
         previous_texts = [""] * num_choices
@@ -555,12 +569,12 @@ class OpenAIServingChat(OpenAIServing):
                     # NOTE num_choices defaults to 1 so this usually executes
                     # once per request
                     for i in range(num_choices):
+                        initial_delta = DeltaMessage(role=role)
+                        if not tool_choice_function_name:
+                            initial_delta.content = ""
                         choice_data = ChatCompletionResponseStreamChoice(
                             index=i,
-                            delta=DeltaMessage(
-                                role=role,
-                                content="",
-                            ),
+                            delta=initial_delta,
                             logprobs=None,
                             finish_reason=None,
                         )
@@ -768,6 +782,41 @@ class OpenAIServingChat(OpenAIServing):
                     else:
                         delta_message = DeltaMessage(content=delta_text)
 
+                    # A named tool grammar emits only the function arguments as
+                    # JSON. If the model-specific parser does not produce a
+                    # tool call for that format, wrap its content here instead
+                    # of returning the arguments as assistant text. Reuse the
+                    # shared named-tool-call streaming helper so tool-call id/
+                    # type/name emission, argument streaming and id generation
+                    # stay identical to the model-parser path
+                    # (vllm.parser.abstract_parser); the reasoning field, which
+                    # the helper does not carry, is preserved separately.
+                    if (
+                        tool_choice_function_name
+                        and delta_message is not None
+                        and not delta_message.tool_calls
+                        and delta_message.content
+                    ):
+                        from vllm.tool_parsers.streaming import (
+                            extract_named_tool_call_streaming,
+                        )
+
+                        reasoning_delta = delta_message.reasoning
+                        tool_call_delta, named_tool_name_sent[i] = (
+                            extract_named_tool_call_streaming(
+                                delta_text=delta_message.content,
+                                function_name=tool_choice_function_name,
+                                function_name_returned=named_tool_name_sent[i],
+                                tool_call_idx=history_tool_call_cnt + i,
+                                tool_call_id_type=self.tool_call_id_type,
+                                tokenizer=tokenizer,
+                            )
+                        )
+                        assert tool_call_delta is not None
+                        delta_message = DeltaMessage(reasoning=reasoning_delta)
+                        delta_message.tool_calls = tool_call_delta.tool_calls
+                        tools_streamed[i] = True
+
                     # update the previous values for the next iteration
                     if (
                         is_mistral_grammar_path
@@ -920,12 +969,20 @@ class OpenAIServingChat(OpenAIServing):
                         # Send the finish response for each request.n only once
                         # In OpenAI's API, when a tool is called, the
                         # finish_reason is:
-                        # "tool_calls" for "auto" or "required" tool calls,
-                        # and "stop" for named tool calls.
-                        if (
+                        # "tool_calls" whenever a tool call was streamed.
+                        tool_calls_streamed = (
                             auto_tools_called
-                            or (tools_streamed[i] and not tool_choice_function_name)
+                            or tools_streamed[i]
                             or (self.use_harmony and harmony_tools_streamed[i])
+                        )
+                        # Only report "tool_calls" when the generation actually
+                        # concluded normally. If it was truncated (e.g. by
+                        # max_tokens -> finish_reason "length"), preserve the
+                        # underlying finish_reason so clients don't execute a
+                        # truncated JSON argument blob as a complete tool call.
+                        if tool_calls_streamed and output.finish_reason in (
+                            None,
+                            "stop",
                         ):
                             finish_reason_ = "tool_calls"
                         else:
@@ -1050,7 +1107,7 @@ class OpenAIServingChat(OpenAIServing):
         conversation: list[ConversationMessage],
         tokenizer: TokenizerLike,
         request_metadata: RequestResponseMetadata,
-        reasoning_parser: ReasoningParser | None = None,
+        parser: Parser | None = None,
     ) -> ErrorResponse | ChatCompletionResponse:
         created_time = int(time.time())
         final_res: RequestOutput | None = None
@@ -1132,8 +1189,14 @@ class OpenAIServingChat(OpenAIServing):
                     message=message,
                     logprobs=logprobs,
                     finish_reason=(
+                        # Preserve a truncated finish_reason (e.g. "length")
+                        # instead of reporting a complete tool call.
                         "tool_calls"
-                        if (tool_call_info is not None and tool_call_info.tools_called)
+                        if (
+                            tool_call_info is not None
+                            and tool_call_info.tools_called
+                            and output.finish_reason in (None, "stop")
+                        )
                         else output.finish_reason
                         if output.finish_reason
                         else "stop"
@@ -1151,28 +1214,36 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
-            if reasoning_parser:
-                # If the reasoning parser is enabled,
-                # tool calls are extracted exclusively from the content.
-                reasoning, content = reasoning_parser.extract_reasoning(
-                    output.text, request=request
+            if parser is not None:
+                reasoning, content, tool_calls = parser.parse(
+                    output.text,
+                    request,
+                    enable_auto_tools=self.enable_auto_tools,
                 )
                 if not request.include_reasoning:
                     reasoning = None
             else:
                 reasoning = None
                 content = output.text
+                tool_calls = []
+
+            # Named tool grammars generate the selected function's arguments
+            # as plain JSON. Preserve parser-produced tool calls, but wrap the
+            # JSON when a model-specific parser leaves it as content.
+            if (
+                isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
+                and not tool_calls
+                and content
+            ):
+                tool_calls = [
+                    FunctionCall(
+                        name=request.tool_choice.function.name,
+                        arguments=content,
+                    )
+                ]
+                content = None
 
             auto_tools_called = False
-            # if auto tools are not enabled, and a named tool choice using
-            #   outlines is not being used
-            tool_calls, content = self._parse_tool_calls_from_content(
-                request=request,
-                tokenizer=tokenizer,
-                content=content,
-                enable_auto_tools=self.enable_auto_tools,
-                tool_parser_cls=self.tool_parser,
-            )
             if is_mistral_tokenizer(tokenizer):
                 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 
@@ -1236,7 +1307,7 @@ class OpenAIServingChat(OpenAIServing):
                 message = ChatMessage(
                     role=role,
                     reasoning=reasoning,
-                    content="",
+                    content=None,
                     tool_calls=tool_call_class_items,
                 )
 
@@ -1346,13 +1417,23 @@ class OpenAIServingChat(OpenAIServing):
                     "completion."
                 )
                 message = ChatMessage(role=role, reasoning=reasoning, content=content)
-            # In OpenAI's API, when a tool is called, the finish_reason is:
-            # "tool_calls" for "auto" or "required" tool calls,
-            # and "stop" for named tool calls.
-            is_finish_reason_tool_calls = auto_tools_called or (
-                request.tool_choice
-                and request.tool_choice == "required"
-                and output.finish_reason == "stop"
+            # Only surface "tool_calls" when the generation concluded normally.
+            # A truncated generation (e.g. max_tokens -> finish_reason "length")
+            # must preserve its real finish_reason so clients don't treat a
+            # truncated argument blob as a complete tool call.
+            is_finish_reason_tool_calls = output.finish_reason in (None, "stop") and (
+                auto_tools_called
+                or (
+                    isinstance(
+                        request.tool_choice, ChatCompletionNamedToolChoiceParam
+                    )
+                    and bool(message.tool_calls)
+                )
+                or (
+                    request.tool_choice
+                    and request.tool_choice == "required"
+                    and output.finish_reason == "stop"
+                )
             )
 
             choice_data = ChatCompletionResponseChoice(

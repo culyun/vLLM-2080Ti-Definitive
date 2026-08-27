@@ -8,11 +8,14 @@ The definitive vLLM runtime for dual RTX 2080 Ti / SM75 serving.
 This is a hardware-focused fork that preserves the patched source, launch
 profiles, and runtime notes needed to reproduce the working 2080 Ti vLLM stack.
 
-Fork release: `v0.1.9`
+Fork release: `v0.1.17`
 Base vLLM: `0.21.0`
 
-Headline evidence: Qwen3.6 27B reaches `100+ tok/s` single-request decode on
-the dual 2080 Ti TP=2 runtime.
+Headline evidence: the Qwen3.x 27B FP8 route is validated on official Qwen3.6
+and Qwen3.8 checkpoints, with the Qwen3.6 baseline reaching `100+ tok/s`
+single-request decode. The Qwen3.x 35B route also validates 256K text-only
+normal/aggressive noMTP routes, 136K text+image normal/aggressive routes, and a
+178K fast/MTP3 route on the same dual 2080 Ti TP=2 runtime.
 
 Language: English | [简体中文](README.zh-CN.md)
 
@@ -42,16 +45,17 @@ that can match or exceed it on the physical resources that matter for LLM
 serving, then use vLLM runtime work to turn those resources into real tokens.
 
 That is the first value of this fork: take old but strong Turing silicon and
-make it behave like a serious 27B/31B-class inference platform through Marlin,
-FlashQLA/FlashInfer, TurboQuant/INT8 KV, MTP, and CUDAGraph integration.
+make it behave like a serious 27B/31B/35B-class inference platform through
+Marlin, FlashQLA/FlashInfer, TurboQuant/INT8 KV, MTP, and CUDAGraph
+integration.
 
 ## 🧩 Core Routes
 
 Serving shape:
 
 - This project optimizes for extreme single-concurrency performance on dual
-  2080 Ti: one personal-agent style workload, one serious 27B/31B model, and
-  the largest practical context window this hardware can sustain.
+  2080 Ti: one personal-agent style workload, one serious 27B/31B/35B model,
+  and the largest practical context window this hardware can sustain.
 - It is not a multi-tenant serving stack. Multi-agent use is supported best as
   queued workspace isolation, not as parallel long-prefill throughput. Long
   prefill work is capacity-safe when tuned, but it is effectively serialized by
@@ -60,9 +64,9 @@ Serving shape:
 Status: 🟢 validated support; 🟡 experimental or partial support; 🔴 known
 failure or clear regression; ⚪ not a target preset or not yet validated.
 
-### Qwen3.6 27B Mature Route
+### Qwen3.x 27B Mature Route
 
-Qwen-family 27B is the primary production route for this fork. It has the
+Qwen3.x-family 27B is the primary production route for this fork. It has the
 broadest tested coverage across FP8/INT4/NVFP4 weights, MTP, FP16/INT8/
 TurboQuant KV, 256K native context, YaRN capacity, and image serving.
 
@@ -76,6 +80,17 @@ TurboQuant KV, 256K native context, YaRN capacity, and image serving.
 | Fast prefill path | 🟢 FlashQLA / FlashInfer | 🟢 FlashQLA / FlashInfer | 🟢 FlashQLA / FlashInfer |
 | Multimodal image serving | 🟢 supported | 🟢 supported | 🟢 supported |
 | Current preset status | 🟢 normal / fast / safe | 🟢 normal / safe | 🟢 fast |
+
+### Qwen3.x 35B Mature Secondary Route
+
+Qwen3.x 35B MoE is the mature secondary route on the same validated dual
+2080 Ti runtime. It broadly inherits the same support surface as the 27B lane:
+MTP, FP16-KV long-context serving, FlashQLA / FlashInfer fast prefill, and
+multimodal image serving are all supported on the shipped 35B presets.
+
+The current shipped set covers FP16-KV 256K text-only `normal` /
+`aggressive`, FP16-KV 136K text+image `normal` / `aggressive`, and a 178K
+`fast` MTP3 preset.
 
 ### Gemma4 31B Experimental Route
 
@@ -98,15 +113,18 @@ better FP16/default-KV headroom than earlier Gemma checkpoints.
 This section records checkpoint-level validation. It is intentionally stricter
 than "vLLM can load it": a supported checkpoint can start and generate, while a
 recommended checkpoint also has a useful throughput/context tradeoff on dual 2080 Ti.
+The generic Qwen3.x 27B FP8 route currently covers the official Qwen3.6 and
+Qwen3.8 checkpoints listed below; other quantized rows remain checkpoint-specific.
 
 | Model route | Weight route | Model cards | Status |
 |---|---|---|---|
-| Qwen3.6 27B FP8 | FP8 | [Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)<br>[Jackrong/Qwopus3.6-27B-v2-FP8](https://huggingface.co/Jackrong/Qwopus3.6-27B-v2-FP8) | 🟢 Recommended |
-| Qwen3.6 27B AWQ | AWQ-INT4 | [QuantTrio/Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ)<br>[mconcat/Qwopus3.6-27B-v2-AWQ-4bit](https://huggingface.co/mconcat/Qwopus3.6-27B-v2-AWQ-4bit) | 🟢 Recommended |
-| Qwen3.6 27B GPTQ | GPTQ-INT4 | [llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4](https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4) | 🟢 Recommended |
-| Qwen3.6 27B NVFP4 | NVFP4 | [unsloth/Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 🟡 Supported |
-| Qwen3.6 27B Quark INT8 | Quark-INT8 | [nameistoken/Qwen3.6-27B-Quark-W8A8-INT8](https://huggingface.co/nameistoken/Qwen3.6-27B-Quark-W8A8-INT8) | 🟡 Supported |
-| Qwen3.6 27B AutoRound | AutoGPTQ-INT8 | [Minachist/Qwen3.6-27B-INT8-AutoRound](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound)<br>[Minachist/Qwen3.6-27B-INT8-AutoRound W8A16-GS128](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound/tree/W8A16-GS128) | 🟡 Supported |
+| Qwen3.x 27B | FP8 | [Qwen/Qwen3.8-27B-FP8](https://huggingface.co/Qwen/Qwen3.8-27B-FP8)<br>[Qwen/Qwen3.6-27B-FP8](https://huggingface.co/Qwen/Qwen3.6-27B-FP8)<br>[Jackrong/Qwopus3.6-27B-v2-FP8](https://huggingface.co/Jackrong/Qwopus3.6-27B-v2-FP8) | 🟢 Recommended |
+| Qwen3.x 35B | FP8 | [Qwen/Qwen3.6-35B-A3B-FP8](https://huggingface.co/Qwen/Qwen3.6-35B-A3B-FP8)<br>[Jackrong/Qwopus3.6-35B-A3B-Coder-FP8](https://huggingface.co/Jackrong/Qwopus3.6-35B-A3B-Coder-FP8)<br>[kyr0/Ornith-35B-FP8-E4M3-MTP](https://huggingface.co/kyr0/Ornith-35B-FP8-E4M3-MTP) | 🟢 Recommended |
+| Qwen3.x 27B | AWQ-INT4 | [QuantTrio/Qwen3.6-27B-AWQ](https://huggingface.co/QuantTrio/Qwen3.6-27B-AWQ)<br>[mconcat/Qwopus3.6-27B-v2-AWQ-4bit](https://huggingface.co/mconcat/Qwopus3.6-27B-v2-AWQ-4bit) | 🟢 Recommended |
+| Qwen3.x 27B | GPTQ-INT4 | [llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4](https://huggingface.co/llmfan46/Qwen3.6-27B-uncensored-heretic-v2-Native-MTP-Preserved-GPTQ-Int4) | 🟢 Recommended |
+| Qwen3.x 27B | NVFP4 | [unsloth/Qwen3.6-27B-NVFP4](https://huggingface.co/unsloth/Qwen3.6-27B-NVFP4) | 🟡 Supported |
+| Qwen3.x 27B | Quark-INT8 | [nameistoken/Qwen3.6-27B-Quark-W8A8-INT8](https://huggingface.co/nameistoken/Qwen3.6-27B-Quark-W8A8-INT8) | 🟡 Supported |
+| Qwen3.x 27B | AutoGPTQ-INT8 | [Minachist/Qwen3.6-27B-INT8-AutoRound](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound)<br>[Minachist/Qwen3.6-27B-INT8-AutoRound W8A16-GS128](https://huggingface.co/Minachist/Qwen3.6-27B-INT8-AutoRound/tree/W8A16-GS128) | 🟡 Supported |
 | Gemma4 31B QAT | QAT + QAT assistant draft | [google/gemma-4-31B-it-qat-w4a16-ct](https://huggingface.co/google/gemma-4-31B-it-qat-w4a16-ct)<br>[google/gemma-4-31B-it-qat-q4_0-unquantized-assistant](https://huggingface.co/google/gemma-4-31B-it-qat-q4_0-unquantized-assistant) | 🟡 Supported |
 | Gemma4 31B GPTQ | GPTQ-INT4 + assistant draft | [ebircak/gemma-4-31B-it-4bit-W4A16-GPTQ](https://huggingface.co/ebircak/gemma-4-31B-it-4bit-W4A16-GPTQ) | 🟡 Supported |
 
@@ -116,7 +134,7 @@ recommended checkpoint also has a useful throughput/context tradeoff on dual 208
   size 2
 - Validated host OS: Ubuntu 22.04/24.04 LTS or Debian 12, on Linux kernel 6.x
 - CUDA/PyTorch: CUDA 12.8, `torch 2.11.0+cu128`
-- Fork release: `v0.1.9`
+- Fork release: `v0.1.17`
 - Base vLLM: `0.21.0`
 - Repository identity: `vllm-2080ti-definitive`
 - Runtime identity: `vllm-sm75-tp2-cu128`
@@ -126,18 +144,20 @@ recommended checkpoint also has a useful throughput/context tradeoff on dual 208
 
 ## 🚀 How To Use
 
-For a source checkout, use two steps.
-
-1. Build the runtime:
+Clone the repository and build the runtime:
 
 ```bash
+git clone https://github.com/weicj/vLLM-2080Ti-Definitive.git
+cd vLLM-2080Ti-Definitive
 ./build.sh
 ```
 
 `build.sh` creates the local `.venv`, installs dependencies, builds the CUDA
 extensions, and prints a clear success or failure result with a build log path.
+Before the install starts, it benchmarks the available PyPI, Git, and PyTorch
+wheel routes and switches to a faster mirror path automatically when needed.
 
-2. Start and manage the service:
+Then start and manage the service:
 
 ```bash
 ./launcher.sh
@@ -145,17 +165,21 @@ extensions, and prints a clear success or failure result with a build log path.
 
 The launcher is the interactive service manager. From the menu you can choose
 the checkpoint directory, apply or edit a profile, select `safe` / `normal` /
-`fast`, choose GPU/TP devices, set the port, switch local-only or LAN access,
-configure chat templates and tool calling, start the server, stop the server,
-or save a custom profile.
+`fast` / `aggressive`, choose GPU/TP devices, set the port, switch local-only
+or LAN access, configure chat templates and tool calling, start the server,
+stop the server, or save a custom profile.
+
+Prefix cache is enabled by default as a global launcher setting. It is not saved
+inside route profiles. For Qwen routes, the launcher also applies the matching
+cache mode needed by the validated prefix-cache path.
 
 Tool calling is supported through the OpenAI-compatible serving API. The
 launcher exposes automatic tool choice, tool parser selection, and strict
 structured tool output as global runtime settings.
 
 After a successful launch, the status panel shows `RUNNING`, the served model
-name, PID, OpenAI-compatible API URL, log file, and cache capacity when vLLM
-reports it.
+name, PID, OpenAI-compatible API URL, log file, prefix-cache state, prompt token
+detail state, and cache capacity when vLLM reports it.
 
 For scripted use:
 
@@ -170,8 +194,9 @@ CUDA_VISIBLE_DEVICES=0,1 \
 ```
 
 Profiles declare compatible modes, not a recommended launch mode. Set
-`MODE=safe`, `MODE=normal`, or `MODE=fast` explicitly when you want a specific
-mode; the launcher validates that choice against the profile.
+`MODE=safe`, `MODE=normal`, `MODE=fast`, or `MODE=aggressive` explicitly when
+you want a specific mode; the launcher validates that choice against the
+profile.
 
 3. Update an existing checkout:
 
@@ -188,8 +213,9 @@ asks whether to run `build.sh` immediately.
 
 Start from [Profile Guide](profiles/README.md). Profiles are organized as
 `profiles/<model>/<mode>/<weight>/<route>.env`, for example
-`qwen27b/normal/int4/fp16kv-256K-mtp3-text-only.env` and
-`qwen27b/fast/int4/tqk8v4-256K-mtp3-text-only.env`.
+`qwen27b/normal/int4/fp16kv-256K-mtp3-text-only.env`,
+`qwen35b/aggressive/fp8/fp16kv-256K-nomtp-text-only.env`, and
+`qwen35b/normal/fp8/fp16kv-136K-nomtp-text-image.env`.
 
 Available modes:
 
@@ -284,6 +310,6 @@ Acceleration components used or integrated by this runtime include:
   acceleration kernels: existing open-source acceleration work integrated and
   profiled for this hardware target.
 
-While this vLLM-2080Ti-Definitive fork won't strictly follow the main fork vLLM,
-the patches merged by vLLM update will be re-validated under SM75 specific scope.
-
+While this vLLM-2080Ti-Definitive fork will not strictly follow upstream vLLM,
+patches merged from upstream updates will be re-validated within the SM75-specific
+scope of this fork.

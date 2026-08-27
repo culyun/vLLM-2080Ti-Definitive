@@ -41,14 +41,18 @@ VLLM_ALLOW_MAMBA_SPEC_FULL_CUDAGRAPH)
 profile_key_is_allowed() {
   case "$1" in
     SERVED_NAME|COMPATIBLE_MODES|MODEL_FAMILY|PROFILE_GROUP|MODEL_VARIANT|\
-QUANTIZATION|KV_CACHE_DTYPE|MAX_MODEL_LEN|GPU_UTIL|MAX_BATCHED_TOKENS|\
+QUANTIZATION|KV_CACHE_DTYPE|MAX_MODEL_LEN|KV_CACHE_MEMORY_BYTES|GPU_UTIL|\
+MAX_BATCHED_TOKENS|\
 MAX_NUM_SEQS|MTP_K|MESSAGE_TYPE|MM_LIMIT_JSON|LANGUAGE_MODEL_ONLY|\
 SKIP_MM_PROFILING|HF_OVERRIDES_JSON|ADDITIONAL_CONFIG_JSON|\
 SPECULATIVE_CONFIG|ATTENTION_BACKEND|DISABLE_HYBRID_KV_CACHE_MANAGER|\
-DISABLE_PREFIX_CACHING|DISABLE_CUSTOM_ALL_REDUCE|\
+DISABLE_CUSTOM_ALL_REDUCE|\
 VLLM_ALLOW_LONG_MAX_MODEL_LEN|VLLM_INT8KV_FA_PREFILL|\
 VLLM_INT8KV_FA_CONTINUATION_DEQUANT|VLLM_INT8KV_FA_CASCADE_DEQUANT|\
-VLLM_INT8KV_FA_CASCADE_TILE_TOKENS)
+VLLM_INT8KV_FA_CASCADE_TILE_TOKENS|\
+VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE|\
+VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS|\
+VLLM_TURBOQUANT_MAX_KV_SPLITS|VLLM_TURBOQUANT_DECODE_BLOCK_KV)
       return 0
       ;;
     *)
@@ -93,11 +97,11 @@ while IFS= read -r -d '' file; do
     for compatible_mode in "${mode_parts[@]}"; do
       compatible_mode=${compatible_mode//[[:space:]]/}
       case "$compatible_mode" in
-        safe|normal|fast)
+        safe|normal|fast|aggressive)
           [[ "$compatible_mode" == "safe" ]] && has_safe=1
         ;;
       *)
-        echo "ERROR $rel: COMPATIBLE_MODES must contain only safe/normal/fast, got $compatible_modes" >&2
+        echo "ERROR $rel: COMPATIBLE_MODES must contain only safe/normal/fast/aggressive, got $compatible_modes" >&2
         ((errors += 1))
         ;;
     esac

@@ -66,6 +66,7 @@ from vllm.utils.torch_utils import (
 )
 from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadata
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 
 # Optional ROCm AITER Triton kernels for the GDN decode fast-path.
 # Availability is checked centrally via rocm_aiter_ops; the actual function
@@ -1330,6 +1331,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     : attn_metadata.num_spec_decodes  # type: ignore[attr-defined]
                 ],
                 num_accepted_tokens=num_accepted_tokens,
+                null_block_id=PAD_SLOT_ID,
                 query_start_loc=spec_query_start_loc,
                 max_query_len=spec_state_indices_tensor.size(-1),
                 validate_data=False,
@@ -1350,6 +1352,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 has_initial_state=has_initial_state,
                 cache_indices=non_spec_state_indices_tensor,
                 query_start_loc=non_spec_query_start_loc,
+                null_block_id=PAD_SLOT_ID,
                 metadata=attn_metadata,
             ).transpose(0, 1)
         elif attn_metadata.num_decodes > 0:
@@ -1364,11 +1367,19 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     : attn_metadata.num_actual_tokens  # type: ignore[attr-defined]
                 ],
                 validate_data=True,
+                null_block_id=PAD_SLOT_ID,
             )
         else:
             mixed_qkv_non_spec = None
 
         query_spec, key_spec, value_spec = self.rearrange_mixed_qkv(mixed_qkv_spec)
+        split_non_spec = (
+            spec_sequence_masks is None
+            and attn_metadata.num_prefills > 0
+            and attn_metadata.num_decodes > 0
+        )
+        num_decode_tokens = attn_metadata.num_decode_tokens
+
         if attn_metadata.num_prefills > 0:
             assert mixed_qkv_non_spec is not None, (
                 "mixed_qkv_non_spec must be provided for prefill path"
@@ -1380,6 +1391,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 a_non_spec = a
                 b_non_spec = b
 
+            if split_non_spec:
+                conv_output_prefill = mixed_qkv_non_spec[num_decode_tokens:]
+                a_prefill = a_non_spec[num_decode_tokens:]
+                b_prefill = b_non_spec[num_decode_tokens:]
+            else:
+                conv_output_prefill = mixed_qkv_non_spec
+                a_prefill = a_non_spec
+                b_prefill = b_non_spec
+
             (
                 query_non_spec,
                 key_non_spec,
@@ -1387,9 +1407,9 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 g_non_spec,
                 beta_non_spec,
             ) = fused_post_conv_prep(
-                conv_output=mixed_qkv_non_spec,
-                a=a_non_spec,
-                b=b_non_spec,
+                conv_output=conv_output_prefill,
+                a=a_prefill,
+                b=b_prefill,
                 A_log=self.A_log,
                 dt_bias=self.dt_bias,
                 num_k_heads=self.num_k_heads // self.tp_size,
@@ -1432,17 +1452,52 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ssm_state_indices=spec_state_indices_tensor,
                     num_accepted_tokens=num_accepted_tokens,
                     use_qk_l2norm_in_kernel=True,
+                    null_block_id=PAD_SLOT_ID,
                 )
             )
         else:
             core_attn_out_spec, last_recurrent_state = None, None
 
-        # 2.2: Process the remaining part
-        if attn_metadata.num_prefills > 0:
+        # 2.2: Peel non-spec decodes from mixed decode+prefill batches.
+        if split_non_spec:
+            assert mixed_qkv_non_spec is not None
             assert non_spec_state_indices_tensor is not None
-            initial_state = ssm_state[non_spec_state_indices_tensor].contiguous()  # type: ignore[index]
-            assert has_initial_state is not None
-            initial_state[~has_initial_state, ...] = 0  # type: ignore[operator]
+            decode_state_indices = non_spec_state_indices_tensor[
+                : attn_metadata.num_decodes
+            ]
+            query_decode, key_decode, value_decode = self.rearrange_mixed_qkv(
+                mixed_qkv_non_spec[:num_decode_tokens]
+            )
+            core_attn_out_decode, _ = fused_sigmoid_gating_delta_rule_update(
+                A_log=self.A_log,
+                a=a_non_spec[:num_decode_tokens],
+                b=b_non_spec[:num_decode_tokens],
+                dt_bias=self.dt_bias,
+                q=query_decode,
+                k=key_decode,
+                v=value_decode,
+                initial_state=ssm_state,
+                inplace_final_state=True,
+                cu_seqlens=non_spec_query_start_loc[
+                    : attn_metadata.num_decodes + 1
+                ],
+                ssm_state_indices=decode_state_indices,
+                use_qk_l2norm_in_kernel=True,
+                null_block_id=PAD_SLOT_ID,
+            )
+        else:
+            core_attn_out_decode = None
+
+        # 2.3: Process the remaining part
+        if attn_metadata.num_prefills > 0:
+            prefill_state_indices = attn_metadata.prefill_state_indices
+            prefill_has_initial_state = attn_metadata.prefill_has_initial_state
+            prefill_query_start_loc = attn_metadata.prefill_query_start_loc
+            assert prefill_state_indices is not None
+            assert prefill_has_initial_state is not None
+            assert prefill_query_start_loc is not None
+            initial_state = ssm_state[prefill_state_indices].contiguous()
+            initial_state[~prefill_has_initial_state, ...] = 0
             (
                 core_attn_out_non_spec,
                 last_recurrent_state,
@@ -1454,15 +1509,13 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 beta=beta_non_spec,
                 initial_state=initial_state,
                 output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=prefill_query_start_loc,
                 chunk_indices=attn_metadata.chunk_indices,
                 chunk_offsets=attn_metadata.chunk_offsets,
                 use_qk_l2norm_in_kernel=False,
             )
             # Init cache
-            ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
-                ssm_state.dtype
-            )
+            ssm_state[prefill_state_indices] = last_recurrent_state.to(ssm_state.dtype)
             global _GDN_DEBUG_PREFILL_USED
             if (
                 _GDN_DEBUG_PREFILL
@@ -1471,15 +1524,15 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ):
                 ref_out, ref_state = fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
-                    a=a_non_spec,
-                    b=b_non_spec,
+                    a=a_prefill,
+                    b=b_prefill,
                     dt_bias=self.dt_bias,
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
                     initial_state=initial_state.clone(),
                     inplace_final_state=False,
-                    cu_seqlens=non_spec_query_start_loc,
+                    cu_seqlens=prefill_query_start_loc,
                     use_qk_l2norm_in_kernel=True,
                 )
                 out_err = (core_attn_out_non_spec.squeeze(0) - ref_out).abs()
@@ -1494,6 +1547,11 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     _debug_tensor_stats("v", value_non_spec),
                     _debug_err_stats("out_err", out_err),
                     _debug_err_stats("state_err", state_err),
+                )
+            if split_non_spec:
+                core_attn_out_non_spec = torch.cat(
+                    [core_attn_out_decode, core_attn_out_non_spec],
+                    dim=1,
                 )
         elif attn_metadata.num_decodes > 0:
             core_attn_out_non_spec, last_recurrent_state = (
@@ -1513,6 +1571,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                     ],
                     ssm_state_indices=non_spec_state_indices_tensor,
                     use_qk_l2norm_in_kernel=True,
+                    null_block_id=PAD_SLOT_ID,
                 )
             )
         else:
@@ -1691,6 +1750,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
                 self.activation,
                 conv_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
                 validate_data=False,
+                null_block_id=PAD_SLOT_ID,
             )
         out_buf = core_attn_out[:num_actual_tokens].unsqueeze(1)
         fused_recurrent_gated_delta_rule_packed_decode(
@@ -1704,6 +1764,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             out=out_buf,
             ssm_state_indices=non_spec_state_indices_tensor[:num_actual_tokens],  # type: ignore[index]
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         if (
             (_GDN_DEBUG_SPLIT or _GDN_DEBUG_COMPARE)
@@ -1778,6 +1839,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         err = (core_attn_out - ref).abs()
         _, ref_state = fused_sigmoid_gating_delta_rule_update(
@@ -1798,6 +1860,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         state_err = (ssm_state_after - ref_state).abs()
         _GDN_DEBUG_COMPARE_USED += 1
@@ -1875,6 +1938,7 @@ class GatedDeltaNetAttention(PluggableLayer, MambaBase):
             ),
             ssm_state_indices=local_state_indices,
             use_qk_l2norm_in_kernel=True,
+            null_block_id=PAD_SLOT_ID,
         )
         recurrent_err = (core_attn_out - recurrent_ref).abs()
         recurrent_state_err = (ssm_state_after - recurrent_state).abs()

@@ -65,10 +65,20 @@ if TYPE_CHECKING:
     VLLM_TURBOQUANT_USE_FLASHINFER_PREFILL: bool = True
     VLLM_TURBOQUANT_SM75_FLASHINFER_PREFILL_MIN_HEAD_DIM: int = 1024
     VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE: bool = True
+    VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE: int = 16
     VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE: bool = False
+    VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE: Literal["off", "on", "auto"] = "auto"
+    VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS: int = 20480
     VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS: int = 0
+    VLLM_TQ_RESERVE_PREFILL_WORKSPACE: bool = True
     VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK: int = 0
     VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS: int = 0
+    VLLM_TURBOQUANT_FORCE_DECODE_SDPA: bool = False
+    VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA: bool = False
+    VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS: int = 131072
+    VLLM_TURBOQUANT_MAX_KV_SPLITS: int | None = None
+    VLLM_TURBOQUANT_DECODE_BLOCK_KV: int = 2
+    VLLM_TURBOQUANT_K8V4_FP8_FORMAT: str = "auto"
     VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE: bool = False
     VLLM_TURBOQUANT_SKIP_PREFILL_STORE: bool = False
     VLLM_PP_LAYER_PARTITION: str | None = None
@@ -273,6 +283,7 @@ if TYPE_CHECKING:
     VLLM_SHARED_EXPERTS_STREAM_TOKEN_THRESHOLD: int = 256
     VLLM_MULTI_STREAM_GEMM_TOKEN_THRESHOLD: int = 1024
     VLLM_COMPILE_CACHE_SAVE_FORMAT: Literal["binary", "unpacked"] = "binary"
+    VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT: int = 0
     VLLM_USE_V2_MODEL_RUNNER: bool = False
     VLLM_LOG_MODEL_INSPECTION: bool = False
     VLLM_DEBUG_MFU_METRICS: bool = False
@@ -556,7 +567,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "MAX_JOBS": lambda: os.getenv("MAX_JOBS", None),
     # Number of threads to use for nvcc
     # By default this is 1.
-    # If set, `MAX_JOBS` will be reduced to avoid oversubscribing the CPU.
+    # This does not reduce `MAX_JOBS`; it only controls nvcc's internal
+    # worker threading.
     "NVCC_THREADS": lambda: os.getenv("NVCC_THREADS", None),
     # If set, vllm will use precompiled binaries (*.so)
     "VLLM_USE_PRECOMPILED": lambda: (
@@ -818,17 +830,57 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE": lambda: bool(
         int(os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE", "1"))
     ),
+    "VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE": lambda: int(
+        os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_PLAN_CACHE_MAXSIZE", "16")
+    ),
     "VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE": lambda: bool(
         int(os.getenv("VLLM_TURBOQUANT_FLASHINFER_PREFILL_CUDAGRAPH_SAFE", "0"))
     ),
+    "VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE": lambda: os.getenv(
+        "VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE", "auto"
+    )
+    .strip()
+    .lower(),
+    "VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS": lambda: int(
+        os.getenv("VLLM_TURBOQUANT_CONTINUATION_PREFIX_COMBINE_MIN_TOKENS", "20480")
+    ),
     "VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_WORKSPACE_RESERVE_TOKENS", "0")
+    ),
+    # When serving a turboquant_* KV cache, reserve VRAM for the runtime
+    # continuation-prefill dequant workspace *before* the KV cache budget is
+    # sized, so max_model_len auto-caps to a value where KV + workspace fit.
+    # Default ON: it only makes sizing safer (never allocates more, only caps).
+    # Set to 0 to restore the legacy behaviour (KV cache sized ignoring the
+    # workspace, which can crash with an illegal memory access at deep prefill).
+    "VLLM_TQ_RESERVE_PREFILL_WORKSPACE": lambda: bool(
+        int(os.getenv("VLLM_TQ_RESERVE_PREFILL_WORKSPACE", "1"))
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_Q_CHUNK", "0")
     ),
     "VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS": lambda: int(
         os.getenv("VLLM_TURBOQUANT_CONTINUATION_SDPA_MAX_QK_CELLS", "0")
+    ),
+    "VLLM_TURBOQUANT_FORCE_DECODE_SDPA": lambda: bool(
+        int(os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA", "0"))
+    ),
+    "VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA": lambda: bool(
+        int(os.getenv("VLLM_TURBOQUANT_FORCE_CONTINUATION_SDPA", "0"))
+    ),
+    "VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS": lambda: int(
+        os.getenv("VLLM_TURBOQUANT_FORCE_DECODE_SDPA_MAX_QK_CELLS", "131072")
+    ),
+    "VLLM_TURBOQUANT_MAX_KV_SPLITS": lambda: (
+        int(value)
+        if (value := os.getenv("VLLM_TURBOQUANT_MAX_KV_SPLITS", "")) != ""
+        else None
+    ),
+    "VLLM_TURBOQUANT_DECODE_BLOCK_KV": lambda: int(
+        os.getenv("VLLM_TURBOQUANT_DECODE_BLOCK_KV", "2")
+    ),
+    "VLLM_TURBOQUANT_K8V4_FP8_FORMAT": lambda: os.getenv(
+        "VLLM_TURBOQUANT_K8V4_FP8_FORMAT", "auto"
     ),
     "VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE": lambda: bool(
         int(os.getenv("VLLM_TURBOQUANT_CUDAGRAPH_SPEC_DECODE_SAFE", "0"))
@@ -1087,6 +1139,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # so that vLLM can verify if p2p is actually working.
     # See https://github.com/vllm-project/vllm/blob/a9b15c606fea67a072416ea0ea115261a2756058/vllm/distributed/device_communicators/custom_all_reduce_utils.py#L101-L108 for details. # noqa
     "VLLM_SKIP_P2P_CHECK": lambda: os.getenv("VLLM_SKIP_P2P_CHECK", "1") == "1",
+    # Custom all-reduce graph input handling. "auto" keeps the registered fast
+    # path for FULL decode graphs and uses the pre-registered staging buffer for
+    # PIECEWISE/prefill graphs, where some SM75 graph-private allocations cannot
+    # be exported through CUDA IPC.
+    "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE": lambda: os.getenv(
+        "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE", "auto"
+    ).lower(),
     # List of quantization kernels that should be disabled, used for testing
     # and performance comparisons. Currently only affects MPLinearKernel
     # selection
@@ -1821,6 +1880,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #     Allows viewing and setting breakpoints in Inductor's code output files.
     "VLLM_COMPILE_CACHE_SAVE_FORMAT": env_with_choices(
         "VLLM_COMPILE_CACHE_SAVE_FORMAT", "binary", ["binary", "unpacked"]
+    ),
+    # Tool arguments commonly contain repeated markdown/code structure. Keep
+    # the generic repetition detector opt-in for tool calls because its
+    # default n-gram heuristic can terminate a valid JSON argument mid-string.
+    "VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT": lambda: int(
+        os.getenv("VLLM_TOOL_REPETITION_DETECTION_MIN_COUNT", "0")
     ),
     # Flag to enable v2 model runner.
     "VLLM_USE_V2_MODEL_RUNNER": lambda: bool(

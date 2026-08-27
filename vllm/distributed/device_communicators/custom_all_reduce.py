@@ -9,12 +9,14 @@ import torch.distributed as dist
 from torch.distributed import ProcessGroup
 
 import vllm.envs as envs
+from vllm.config import CUDAGraphMode
 from vllm import _custom_ops as ops
 from vllm.distributed.device_communicators.all_reduce_utils import (
     CUSTOM_ALL_REDUCE_MAX_SIZES,
     gpu_p2p_access_check,
 )
 from vllm.distributed.parallel_state import in_the_same_node_as
+from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 
@@ -26,6 +28,10 @@ except Exception:
     custom_ar = False
 
 logger = init_logger(__name__)
+
+# [FORK] custom AR disable flag during profiling (128K IPC leak debug).
+# Defined after all imports to satisfy Ruff E402 (review #108 round 7 P3).
+_PROFILING_CAR_DISABLED = False
 
 
 def _can_p2p(rank: int, world_size: int) -> bool:
@@ -270,7 +276,9 @@ class CustomAllreduce:
             return None
         if self._IS_CAPTURING:
             if torch.cuda.is_current_stream_capturing():
-                return self.all_reduce(input, registered=True)
+                return self.all_reduce(
+                    input, registered=self._use_registered_graph_inputs()
+                )
             else:
                 # If warm up, mimic the allocation pattern since custom
                 # allreduce is out-of-place.
@@ -280,6 +288,30 @@ class CustomAllreduce:
             # cost of cudaMemcpy, which should be small (<=1% of overall
             # latency) compared to the performance gain of using custom kernels
             return self.all_reduce(input, registered=False)
+
+    def _use_registered_graph_inputs(self) -> bool:
+        graph_input_mode = envs.VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE
+        if graph_input_mode == "registered":
+            return True
+        if graph_input_mode == "staging":
+            return False
+        if graph_input_mode != "auto":
+            raise ValueError(
+                "VLLM_CUSTOM_ALLREDUCE_GRAPH_INPUT_MODE must be one of "
+                f"auto, registered, or staging. Got {graph_input_mode!r}."
+            )
+
+        # Full decode graphs keep the fast registered-input path. SM75
+        # piecewise/prefill captures may allocate graph-private large buffers
+        # that cannot be exported through CUDA IPC, so those fall back to the
+        # pre-registered staging buffer.
+        if not is_forward_context_available():
+            return False
+        try:
+            forward_context = get_forward_context()
+        except AssertionError:
+            return False
+        return forward_context.cudagraph_runtime_mode == CUDAGraphMode.FULL
 
     def close(self):
         if not self.disabled and self._ptr:
