@@ -741,6 +741,7 @@ save_manager_state() {
     printf 'SERVICE_SCOPE=%q\n' "${SERVICE_SCOPE:-local}"
     printf 'LAST_PID_FILE=%q\n' "${LAST_PID_FILE:-}"
     printf 'LAST_LOG_FILE=%q\n' "${LAST_LOG_FILE:-}"
+    printf 'SERVICE_START_TIME=%q\n' "${SERVICE_START_TIME:-}"
     printf 'LAST_API_LOCAL=%q\n' "${LAST_API_LOCAL:-}"
     printf 'LAST_API_LAN=%q\n' "${LAST_API_LAN:-}"
     printf 'LAST_SMOKE_OUTPUT=%q\n' "${LAST_SMOKE_OUTPUT:-}"
@@ -1155,9 +1156,66 @@ validate_parallelism() {
   fi
 }
 
+# A wedged GSP firmware (Xid 119; see NVIDIA_TURING_NOTES.md) makes nvidia-smi
+# itself hang indefinitely, so every invocation is bounded and a timeout is
+# reported as a driver fault instead of hanging the launcher.
+NVIDIA_SMI_TIMEOUT_SECONDS=${NVIDIA_SMI_TIMEOUT_SECONDS:-5}
+
+run_nvidia_smi() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 127
+  local rc=0
+  if command -v timeout >/dev/null 2>&1; then
+    timeout --kill-after=2 "$NVIDIA_SMI_TIMEOUT_SECONDS" nvidia-smi "$@" 2>/dev/null || rc=$?
+  else
+    nvidia-smi "$@" 2>/dev/null || rc=$?
+  fi
+  if [[ "$rc" == "124" || "$rc" == "137" ]]; then
+    {
+      echo "ERROR: nvidia-smi timed out after ${NVIDIA_SMI_TIMEOUT_SECONDS}s — GPU driver unresponsive."
+      echo "       On Turing this is the wedged-GSP-firmware signature (Xid 119); recovery is a reboot."
+      echo "       See NVIDIA_TURING_NOTES.md and: journalctl -k | grep 'NVRM: Xid'"
+    } >&2
+  fi
+  return "$rc"
+}
+
+gpu_driver_responsive() {
+  command -v nvidia-smi >/dev/null 2>&1 || return 0
+  local rc=0
+  run_nvidia_smi --query-gpu=index --format=csv,noheader >/dev/null || rc=$?
+  [[ "$rc" != "124" && "$rc" != "137" ]]
+}
+
+scan_kernel_xids() {
+  local since=$1 context=$2 lines
+  command -v journalctl >/dev/null 2>&1 || return 0
+  if ! journalctl -k --no-pager -n 1 >/dev/null 2>&1; then
+    {
+      echo "WARNING: kernel journal not readable; cannot scan for NVRM Xid errors ($context)."
+      echo "         Check manually: journalctl -k | grep 'NVRM: Xid' (see NVIDIA_TURING_NOTES.md)."
+    } >&2
+    return 0
+  fi
+  # Match 'NVRM: Xid' specifically: a bare xid grep also hits e.g. the r8169
+  # NIC driver's chip XID line.
+  if [[ -n "$since" ]]; then
+    lines=$(journalctl -k --no-pager --since "$since" 2>/dev/null | grep -F 'NVRM: Xid' || true)
+  else
+    lines=$(journalctl -k -b --no-pager 2>/dev/null | grep -F 'NVRM: Xid' || true)
+  fi
+  [[ -n "$lines" ]] || return 0
+  {
+    echo "WARNING: NVIDIA Xid errors in the kernel log ($context, since ${since:-boot}):"
+    printf '%s\n' "$lines" | tail -n 10
+    echo "         A GPU fault inside the serving window makes output from that window suspect."
+    echo "         See NVIDIA_TURING_NOTES.md (Xid 119 = wedged GSP firmware; reboot to recover)."
+  } >&2
+  return 1
+}
+
 list_nvidia_gpus() {
   command -v nvidia-smi >/dev/null 2>&1 || return 1
-  nvidia-smi --query-gpu=index,name --format=csv,noheader 2>/dev/null |
+  run_nvidia_smi --query-gpu=index,name --format=csv,noheader |
     awk -F, '
       {
         idx = $1
@@ -1794,7 +1852,7 @@ current_profile_label() {
 detect_default_gpu_devices() {
   local detected
   detected=$(
-    list_nvidia_gpus 2>/dev/null |
+    list_nvidia_gpus |
       awk -F'\t' '
         BEGIN { sep = "" }
         tolower($2) ~ /2080[[:space:]]*ti/ {
@@ -3029,6 +3087,7 @@ stop_service() {
       else
         echo "Stop requested, but the process is still running."
       fi
+      scan_kernel_xids "${SERVICE_START_TIME:-}" "serving window" || true
       ;;
     *)
       echo "Stop cancelled."
@@ -3754,6 +3813,10 @@ launch_server() {
     fi
   fi
   validate_parallelism || return 1
+  if ! gpu_driver_responsive; then
+    echo "ERROR: aborting launch: GPU driver did not respond (possible wedged GSP firmware; see NVIDIA_TURING_NOTES.md)." >&2
+    return 1
+  fi
   if [[ -z "${SERVED_NAME:-}" || "$SERVED_NAME" == "." || "$SERVED_NAME" == "/" ]]; then
     echo "ERROR: Served model name is empty. Set SERVED_NAME or choose a valid checkpoint directory." >&2
     return 1
@@ -3826,6 +3889,7 @@ launch_server() {
   echo "  Model: $MODEL_DIR"
   echo "  Bind: $host_arg:$PORT"
 
+  SERVICE_START_TIME=$(date '+%Y-%m-%d %H:%M:%S')
   if command -v setsid >/dev/null 2>&1; then
     nohup setsid "$RUNTIME_ROOT/.venv/bin/python" -m vllm.entrypoints.openai.api_server "${VLLM_ARGS[@]}" >>"$log_file" 2>&1 &
   else
@@ -3859,6 +3923,7 @@ launch_server() {
     echo "START FAILED"
     echo "Log: $log_file"
     tail -n 120 "$log_file" || true
+    scan_kernel_xids "${SERVICE_START_TIME:-}" "startup window" || true
     echo "Cleaning up failed server processes..."
     cleanup_failed_launch "$pid_file"
     restore_overcommit_memory || true
@@ -3867,6 +3932,7 @@ launch_server() {
 
   echo "Health check: OK"
   if [[ "${SKIP_STARTUP_SMOKE:-0}" == "1" ]]; then
+    scan_kernel_xids "${SERVICE_START_TIME:-}" "startup window" || true
     restore_overcommit_memory || true
 
     local api_local="http://127.0.0.1:${PORT}/v1"
@@ -3899,7 +3965,10 @@ launch_server() {
 
   local smoke_output
   echo "Running smoke test..."
-  if ! smoke_output=$(smoke_test "$url_host" 2>&1); then
+  local smoke_rc=0
+  smoke_output=$(smoke_test "$url_host" 2>&1) || smoke_rc=$?
+  scan_kernel_xids "${SERVICE_START_TIME:-}" "startup window" || true
+  if [[ "$smoke_rc" != "0" ]]; then
     echo
     echo "SMOKE FAILED"
     echo "$smoke_output"
